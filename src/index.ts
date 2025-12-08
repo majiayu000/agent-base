@@ -33,6 +33,7 @@ export type {
   AgentEvents,
   // Results
   AgentResult,
+  TokenUsageStats,
   // Content blocks
   ContentBlock,
   ThinkingBlock,

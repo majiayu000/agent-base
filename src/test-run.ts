@@ -54,6 +54,12 @@ async function main() {
         console.log(`     - ${tc.name}${tc.error ? ' (error)' : ''}`);
       });
     }
+    if (result.usage) {
+      console.log('   Token Usage:');
+      console.log(`     - Prompt: ${result.usage.promptTokens}`);
+      console.log(`     - Completion: ${result.usage.completionTokens}`);
+      console.log(`     - Total: ${result.usage.totalTokens}`);
+    }
     console.log('='.repeat(50));
   } catch (error) {
     console.error('\n❌ Test failed:', error);

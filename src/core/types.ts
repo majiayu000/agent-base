@@ -15,6 +15,8 @@ export interface AgentConfig {
   maxIterations: number;
   /** Maximum context tokens before compression */
   maxContextTokens: number;
+  /** Maximum tool result length in characters (default: 10000) */
+  maxToolResultLength: number;
 }
 
 export const defaultConfig: AgentConfig = {
@@ -23,6 +25,7 @@ export const defaultConfig: AgentConfig = {
   maxTokens: Number(process.env.AGENT_MAX_TOKENS) || 16000,
   maxIterations: Number(process.env.AGENT_MAX_ITERATIONS) || 15,
   maxContextTokens: 150000,
+  maxToolResultLength: 10000,
 };
 
 // ============================================================================
@@ -149,6 +152,12 @@ export interface ToolExecutionResult {
 // Agent Result Types
 // ============================================================================
 
+export interface TokenUsageStats {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export interface AgentResult {
   /** Final text response */
   response: string;
@@ -165,4 +174,6 @@ export interface AgentResult {
   thinking?: string;
   /** Whether max iterations was reached */
   maxIterationsReached: boolean;
+  /** Token usage statistics from all LLM calls */
+  usage?: TokenUsageStats;
 }

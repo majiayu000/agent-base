@@ -1,7 +1,7 @@
 import { LLMClient, parseStream } from './llm-client.js';
 import { ContextManager } from './context-manager.js';
 import { ToolExecutor } from './tool-executor.js';
-import type { AgentConfig, AgentEvents, AgentResult, LLMClientConfig, Message, Tool } from './types.js';
+import type { AgentConfig, AgentEvents, AgentResult, LLMClientConfig, Message, Tool, TokenUsageStats } from './types.js';
 import { defaultConfig } from './types.js';
 
 // ============================================================================
@@ -39,6 +39,7 @@ export class Agent {
     this.llmClient = new LLMClient(options.llmConfig);
     this.context = new ContextManager({
       maxTokens: this.config.maxContextTokens,
+      onCompact: options.events?.onContextCompact,
     });
     this.toolExecutor = new ToolExecutor();
     this.events = options.events || {};
@@ -100,6 +101,7 @@ export class Agent {
       toolCalls: [],
       thinking: '',
       maxIterationsReached: false,
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
 
     // ReAct Loop: Think → Act → Observe → Repeat
@@ -126,6 +128,12 @@ export class Agent {
           onToolCallStart: (name) => {
             // Early notification that a tool is being called
           },
+          onUsage: (usage) => {
+            // Accumulate token usage across iterations
+            result.usage!.promptTokens += usage.promptTokens;
+            result.usage!.completionTokens += usage.completionTokens;
+            result.usage!.totalTokens += usage.totalTokens;
+          },
         });
 
         // Build assistant message
@@ -147,8 +155,8 @@ export class Agent {
           return result;
         }
 
-        // Execute tool calls
-        for (const toolCall of parsed.toolCalls) {
+        // Execute tool calls in parallel
+        const toolPromises = parsed.toolCalls.map(async (toolCall) => {
           const toolName = toolCall.function.name;
           let toolArgs: unknown;
 
@@ -167,11 +175,24 @@ export class Agent {
           // Notify tool result
           this.events.onToolResult?.(toolName, execResult.result, execResult.error ? new Error(execResult.error) : undefined);
 
+          return { toolCall, toolName, toolArgs, execResult };
+        });
+
+        const toolResults = await Promise.all(toolPromises);
+
+        // Process results in order (maintain context order)
+        for (const { toolCall, toolName, toolArgs, execResult } of toolResults) {
+          // Truncate result if too long
+          let resultContent = execResult.error ? `Error: ${execResult.error}` : execResult.result;
+          if (resultContent.length > this.config.maxToolResultLength) {
+            resultContent = resultContent.slice(0, this.config.maxToolResultLength) + '\n...[truncated]';
+          }
+
           // Record tool call in result
           result.toolCalls.push({
             name: toolName,
             args: toolArgs,
-            result: execResult.result,
+            result: resultContent,
             error: execResult.error,
           });
 
@@ -179,7 +200,7 @@ export class Agent {
           this.context.add({
             role: 'tool',
             tool_call_id: toolCall.id,
-            content: execResult.error ? `Error: ${execResult.error}` : execResult.result,
+            content: resultContent,
           });
         }
       } catch (error) {

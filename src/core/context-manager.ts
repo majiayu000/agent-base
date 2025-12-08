@@ -13,6 +13,8 @@ export interface ContextManagerOptions {
   preserveRecentCount?: number;
   /** Custom token estimator function */
   tokenEstimator?: (text: string) => number;
+  /** Callback when context is compacted */
+  onCompact?: (beforeTokens: number, afterTokens: number) => void;
 }
 
 export class ContextManager {
@@ -22,12 +24,14 @@ export class ContextManager {
   private readonly compactionThreshold: number;
   private readonly preserveRecentCount: number;
   private readonly tokenEstimator: (text: string) => number;
+  private readonly onCompact?: (beforeTokens: number, afterTokens: number) => void;
 
   constructor(options: ContextManagerOptions) {
     this.maxTokens = options.maxTokens;
     this.compactionThreshold = options.compactionThreshold ?? 0.8;
     this.preserveRecentCount = options.preserveRecentCount ?? 20;
     this.tokenEstimator = options.tokenEstimator ?? this.defaultTokenEstimator;
+    this.onCompact = options.onCompact;
   }
 
   /**
@@ -121,6 +125,9 @@ export class ContextManager {
 
     // Recalculate token count
     this.tokenCount = this.messages.reduce((sum, msg) => sum + this.estimateMessageTokens(msg), 0);
+
+    // Notify callback
+    this.onCompact?.(beforeTokens, this.tokenCount);
 
     return { beforeTokens, afterTokens: this.tokenCount };
   }
