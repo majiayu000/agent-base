@@ -156,6 +156,9 @@ export {
   createPlanner,
   MemoryStore,
   createMemoryStore,
+  Router,
+  createRouter,
+  createAgentRoute,
 } from './patterns/index.js';
 
 export type {
@@ -170,4 +173,8 @@ export type {
   MemorySearchResult,
   MemoryConfig,
   MemoryStats,
+  Route,
+  RoutingDecision,
+  RouterConfig,
+  RoutingResult,
 } from './patterns/index.js';

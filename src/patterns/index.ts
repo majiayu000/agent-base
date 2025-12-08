@@ -37,3 +37,16 @@ export type {
   MemoryConfig,
   MemoryStats,
 } from './memory.js';
+
+export {
+  Router,
+  createRouter,
+  createAgentRoute,
+} from './routing.js';
+
+export type {
+  Route,
+  RoutingDecision,
+  RouterConfig,
+  RoutingResult,
+} from './routing.js';
