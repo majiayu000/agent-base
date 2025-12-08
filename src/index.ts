@@ -163,6 +163,9 @@ export {
   createGuardrails,
   createDefaultGuardrails,
   builtinRules,
+  HumanInTheLoop,
+  createHITL,
+  requireApproval,
 } from './patterns/index.js';
 
 export type {
@@ -185,4 +188,8 @@ export type {
   GuardrailViolation,
   GuardrailResult,
   GuardrailsConfig,
+  ApprovalRequest,
+  ApprovalResponse,
+  HITLConfig,
+  HITLResult,
 } from './patterns/index.js';

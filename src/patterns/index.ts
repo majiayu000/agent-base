@@ -69,3 +69,16 @@ export type {
   GuardrailResult,
   GuardrailsConfig,
 } from './guardrails.js';
+
+export {
+  HumanInTheLoop,
+  createHITL,
+  requireApproval,
+} from './human-in-the-loop.js';
+
+export type {
+  ApprovalRequest,
+  ApprovalResponse,
+  HITLConfig,
+  HITLResult,
+} from './human-in-the-loop.js';
