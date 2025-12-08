@@ -17,6 +17,10 @@ export interface AgentConfig {
   maxContextTokens: number;
   /** Maximum tool result length in characters (default: 10000) */
   maxToolResultLength: number;
+  /** Maximum retries for LLM requests (default: 3) */
+  maxRetries: number;
+  /** Initial retry delay in ms (default: 1000) */
+  retryDelayMs: number;
 }
 
 export const defaultConfig: AgentConfig = {
@@ -26,6 +30,8 @@ export const defaultConfig: AgentConfig = {
   maxIterations: Number(process.env.AGENT_MAX_ITERATIONS) || 15,
   maxContextTokens: 150000,
   maxToolResultLength: 10000,
+  maxRetries: 3,
+  retryDelayMs: 1000,
 };
 
 // ============================================================================

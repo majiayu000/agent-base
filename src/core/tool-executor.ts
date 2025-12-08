@@ -6,6 +6,56 @@ import type { Tool, ToolCall, ToolExecutionResult, ToolSchema } from './types.js
 
 export class ToolExecutor {
   private tools: Map<string, Tool> = new Map();
+  private cache: Map<string, { result: string; timestamp: number }> = new Map();
+  private cacheTTL: number = 60000; // 1 minute default
+
+  /**
+   * Set cache TTL in milliseconds
+   */
+  setCacheTTL(ttl: number): void {
+    this.cacheTTL = ttl;
+  }
+
+  /**
+   * Generate cache key for tool call
+   */
+  private getCacheKey(toolName: string, args: string): string {
+    return `${toolName}:${args}`;
+  }
+
+  /**
+   * Get cached result if valid
+   */
+  private getCachedResult(toolName: string, args: string): string | null {
+    const key = this.getCacheKey(toolName, args);
+    const cached = this.cache.get(key);
+
+    if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
+      return cached.result;
+    }
+
+    // Clean up expired entry
+    if (cached) {
+      this.cache.delete(key);
+    }
+
+    return null;
+  }
+
+  /**
+   * Cache a result
+   */
+  private setCachedResult(toolName: string, args: string, result: string): void {
+    const key = this.getCacheKey(toolName, args);
+    this.cache.set(key, { result, timestamp: Date.now() });
+  }
+
+  /**
+   * Clear the cache
+   */
+  clearCache(): void {
+    this.cache.clear();
+  }
 
   /**
    * Register a tool
@@ -69,11 +119,12 @@ export class ToolExecutor {
   }
 
   /**
-   * Execute a single tool call
+   * Execute a single tool call (with caching)
    */
-  async execute(toolCall: ToolCall): Promise<ToolExecutionResult> {
+  async execute(toolCall: ToolCall, useCache = true): Promise<ToolExecutionResult> {
     const startTime = Date.now();
     const toolName = toolCall.function.name;
+    const argsStr = toolCall.function.arguments || '{}';
 
     const tool = this.tools.get(toolName);
 
@@ -87,11 +138,24 @@ export class ToolExecutor {
       };
     }
 
+    // Check cache first
+    if (useCache) {
+      const cachedResult = this.getCachedResult(toolName, argsStr);
+      if (cachedResult !== null) {
+        return {
+          toolCallId: toolCall.id,
+          toolName,
+          result: cachedResult,
+          durationMs: Date.now() - startTime,
+        };
+      }
+    }
+
     try {
       // Parse arguments
       let args: unknown;
       try {
-        args = JSON.parse(toolCall.function.arguments || '{}');
+        args = JSON.parse(argsStr);
       } catch (parseError) {
         return {
           toolCallId: toolCall.id,
@@ -107,6 +171,11 @@ export class ToolExecutor {
 
       // Convert result to string
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+
+      // Cache the result
+      if (useCache) {
+        this.setCachedResult(toolName, argsStr, resultStr);
+      }
 
       return {
         toolCallId: toolCall.id,

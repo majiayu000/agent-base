@@ -3,6 +3,8 @@ import { ContextManager } from './context-manager.js';
 import { ToolExecutor } from './tool-executor.js';
 import type { AgentConfig, AgentEvents, AgentResult, LLMClientConfig, Message, Tool, TokenUsageStats } from './types.js';
 import { defaultConfig } from './types.js';
+import type { AgentMiddleware, MiddlewareContext } from '../utils/middleware.js';
+import { MiddlewareRunner } from '../utils/middleware.js';
 
 // ============================================================================
 // Agent Options
@@ -17,6 +19,8 @@ export interface AgentOptions {
   llmConfig?: Partial<LLMClientConfig>;
   /** Event callbacks for observability */
   events?: AgentEvents;
+  /** Middleware chain */
+  middlewares?: AgentMiddleware[];
 }
 
 // ============================================================================
@@ -29,7 +33,9 @@ export class Agent {
   private readonly context: ContextManager;
   private readonly toolExecutor: ToolExecutor;
   private readonly events: AgentEvents;
+  private readonly middleware: MiddlewareRunner;
   private isRunning = false;
+  private abortController: AbortController | null = null;
 
   constructor(options: AgentOptions) {
     // Merge config with defaults
@@ -43,6 +49,14 @@ export class Agent {
     });
     this.toolExecutor = new ToolExecutor();
     this.events = options.events || {};
+
+    // Initialize middleware
+    this.middleware = new MiddlewareRunner();
+    if (options.middlewares) {
+      for (const mw of options.middlewares) {
+        this.middleware.use(mw);
+      }
+    }
 
     // Add system prompt
     this.context.add({
@@ -69,6 +83,14 @@ export class Agent {
   }
 
   /**
+   * Add middleware to the agent
+   */
+  use(middleware: AgentMiddleware): this {
+    this.middleware.use(middleware);
+    return this;
+  }
+
+  /**
    * Run the agent with a user input (streaming)
    */
   async run(userInput: string): Promise<AgentResult> {
@@ -77,18 +99,67 @@ export class Agent {
     }
 
     this.isRunning = true;
+    this.abortController = new AbortController();
 
     try {
       return await this.executeReActLoop(userInput);
     } finally {
       this.isRunning = false;
+      this.abortController = null;
     }
+  }
+
+  /**
+   * Abort the current run
+   */
+  abort(): void {
+    if (this.abortController) {
+      this.abortController.abort();
+    }
+  }
+
+  /**
+   * Retry wrapper with exponential backoff
+   */
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < this.config.maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        // Don't retry on abort
+        if (this.abortController?.signal.aborted) {
+          throw lastError;
+        }
+
+        // Exponential backoff
+        if (attempt < this.config.maxRetries - 1) {
+          const delay = this.config.retryDelayMs * Math.pow(2, attempt);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    throw lastError;
   }
 
   /**
    * Main ReAct loop implementation
    */
   private async executeReActLoop(userInput: string): Promise<AgentResult> {
+    // Create middleware context
+    const runId = crypto.randomUUID();
+    const mwCtx: MiddlewareContext = {
+      runId,
+      iteration: 0,
+      startTime: Date.now(),
+      metadata: {},
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
+    };
+
     // Add user message to context
     this.context.add({
       role: 'user',
@@ -106,16 +177,28 @@ export class Agent {
 
     // ReAct Loop: Think → Act → Observe → Repeat
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
+      // Check abort signal
+      if (this.abortController?.signal.aborted) {
+        result.response = 'Agent run was aborted.';
+        return result;
+      }
+
       result.iterations = iteration + 1;
+      mwCtx.iteration = iteration + 1;
 
       try {
-        // Create streaming request
-        const stream = await this.llmClient.createStream({
-          model: this.config.model,
-          messages: this.context.getMessages(),
-          tools: this.toolExecutor.count > 0 ? this.toolExecutor.getSchemas() : undefined,
-          thinkingBudget: this.config.thinkingBudget,
-          maxTokens: this.config.maxTokens,
+        // Run beforeRequest middleware
+        const messages = await this.middleware.runBeforeRequest(mwCtx, this.context.getMessages());
+
+        // Create streaming request with retry
+        const stream = await this.withRetry(async () => {
+          return this.llmClient.createStream({
+            model: this.config.model,
+            messages,
+            tools: this.toolExecutor.count > 0 ? this.toolExecutor.getSchemas() : undefined,
+            thinkingBudget: this.config.thinkingBudget,
+            maxTokens: this.config.maxTokens,
+          });
         });
 
         // Parse stream with callbacks
@@ -149,19 +232,30 @@ export class Agent {
         // Notify iteration complete
         this.events.onIteration?.(iteration + 1, assistantMessage);
 
+        // Run afterResponse middleware
+        await this.middleware.runAfterResponse(mwCtx, {
+          content: parsed.content,
+          toolCalls: parsed.toolCalls,
+        });
+
         // Check if we're done (no tool calls)
         if (!parsed.toolCalls || parsed.toolCalls.length === 0) {
           result.response = parsed.content;
+          // Run onComplete middleware
+          await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
           return result;
         }
 
         // Execute tool calls in parallel
         const toolPromises = parsed.toolCalls.map(async (toolCall) => {
-          const toolName = toolCall.function.name;
+          // Run beforeToolCall middleware
+          const modifiedToolCall = await this.middleware.runBeforeToolCall(mwCtx, toolCall);
+
+          const toolName = modifiedToolCall.function.name;
           let toolArgs: unknown;
 
           try {
-            toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+            toolArgs = JSON.parse(modifiedToolCall.function.arguments || '{}');
           } catch {
             toolArgs = {};
           }
@@ -170,12 +264,15 @@ export class Agent {
           this.events.onToolCall?.(toolName, toolArgs);
 
           // Execute tool
-          const execResult = await this.toolExecutor.execute(toolCall);
+          let execResult = await this.toolExecutor.execute(modifiedToolCall);
+
+          // Run afterToolCall middleware
+          execResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
 
           // Notify tool result
           this.events.onToolResult?.(toolName, execResult.result, execResult.error ? new Error(execResult.error) : undefined);
 
-          return { toolCall, toolName, toolArgs, execResult };
+          return { toolCall: modifiedToolCall, toolName, toolArgs, execResult };
         });
 
         const toolResults = await Promise.all(toolPromises);
@@ -207,6 +304,9 @@ export class Agent {
         const err = error instanceof Error ? error : new Error(String(error));
         this.events.onError?.(err);
 
+        // Run onError middleware
+        await this.middleware.runOnError(mwCtx, err);
+
         // Add error message to context so LLM can recover
         this.context.add({
           role: 'user',
@@ -217,6 +317,7 @@ export class Agent {
 
     // Max iterations reached
     result.maxIterationsReached = true;
+    await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
     result.response = 'Maximum iterations reached. The task may not be complete.';
 
     return result;
