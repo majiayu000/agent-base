@@ -25,3 +25,15 @@ export type {
   PlanningConfig,
   PlanningResult,
 } from './planning.js';
+
+export {
+  MemoryStore,
+  createMemoryStore,
+} from './memory.js';
+
+export type {
+  MemoryEntry,
+  MemorySearchResult,
+  MemoryConfig,
+  MemoryStats,
+} from './memory.js';

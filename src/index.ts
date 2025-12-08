@@ -154,6 +154,8 @@ export {
   reflectionMiddleware,
   Planner,
   createPlanner,
+  MemoryStore,
+  createMemoryStore,
 } from './patterns/index.js';
 
 export type {
@@ -164,4 +166,8 @@ export type {
   Plan,
   PlanningConfig,
   PlanningResult,
+  MemoryEntry,
+  MemorySearchResult,
+  MemoryConfig,
+  MemoryStats,
 } from './patterns/index.js';
