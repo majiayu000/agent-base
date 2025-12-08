@@ -82,3 +82,21 @@ export type {
   HITLConfig,
   HITLResult,
 } from './human-in-the-loop.js';
+
+export {
+  PromptChain,
+  createChain,
+  createStep,
+  ChainBuilder,
+  chainBuilder,
+  executeParallel,
+  executeConditional,
+} from './chaining.js';
+
+export type {
+  ChainStep,
+  ChainContext,
+  ChainStepResult,
+  ChainResult,
+  ChainConfig,
+} from './chaining.js';

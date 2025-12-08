@@ -166,6 +166,13 @@ export {
   HumanInTheLoop,
   createHITL,
   requireApproval,
+  PromptChain,
+  createChain,
+  createStep,
+  ChainBuilder,
+  chainBuilder,
+  executeParallel,
+  executeConditional,
 } from './patterns/index.js';
 
 export type {
@@ -192,4 +199,9 @@ export type {
   ApprovalResponse,
   HITLConfig,
   HITLResult,
+  ChainStep,
+  ChainContext,
+  ChainStepResult,
+  ChainResult,
+  ChainConfig,
 } from './patterns/index.js';
