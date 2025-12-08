@@ -152,10 +152,16 @@ export {
   Reflection,
   createReflection,
   reflectionMiddleware,
+  Planner,
+  createPlanner,
 } from './patterns/index.js';
 
 export type {
   ReflectionConfig,
   ReflectionResult,
   EvaluationResult,
+  PlanStep,
+  Plan,
+  PlanningConfig,
+  PlanningResult,
 } from './patterns/index.js';

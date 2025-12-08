@@ -13,3 +13,15 @@ export type {
   ReflectionResult,
   EvaluationResult,
 } from './reflection.js';
+
+export {
+  Planner,
+  createPlanner,
+} from './planning.js';
+
+export type {
+  PlanStep,
+  Plan,
+  PlanningConfig,
+  PlanningResult,
+} from './planning.js';
