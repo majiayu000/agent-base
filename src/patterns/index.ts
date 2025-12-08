@@ -100,3 +100,26 @@ export type {
   ChainResult,
   ChainConfig,
 } from './chaining.js';
+
+export {
+  MultiAgentCoordinator,
+  createCoordinator,
+  createWorker,
+  createRole,
+  roundRobinStrategy,
+  capabilityStrategy,
+  SupervisorWorkerPattern,
+  PipelinePattern,
+  DebatePattern,
+} from './multi-agent.js';
+
+export type {
+  AgentRole,
+  AgentTask,
+  AgentMessage,
+  AgentWorker,
+  MultiAgentContext,
+  CoordinationStrategy,
+  MultiAgentConfig,
+  MultiAgentResult,
+} from './multi-agent.js';

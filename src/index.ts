@@ -173,6 +173,15 @@ export {
   chainBuilder,
   executeParallel,
   executeConditional,
+  MultiAgentCoordinator,
+  createCoordinator,
+  createWorker,
+  createRole,
+  roundRobinStrategy,
+  capabilityStrategy,
+  SupervisorWorkerPattern,
+  PipelinePattern,
+  DebatePattern,
 } from './patterns/index.js';
 
 export type {
@@ -204,4 +213,12 @@ export type {
   ChainStepResult,
   ChainResult,
   ChainConfig,
+  AgentRole,
+  AgentTask,
+  AgentMessage,
+  AgentWorker,
+  MultiAgentContext,
+  CoordinationStrategy,
+  MultiAgentConfig,
+  MultiAgentResult,
 } from './patterns/index.js';
