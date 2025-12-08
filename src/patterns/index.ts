@@ -50,3 +50,22 @@ export type {
   RouterConfig,
   RoutingResult,
 } from './routing.js';
+
+export {
+  Guardrails,
+  createGuardrails,
+  createDefaultGuardrails,
+  builtinRules,
+  promptInjectionRule,
+  piiDetectionRule,
+  xssSanitizeRule,
+  contentLengthRule,
+  toxicContentRule,
+} from './guardrails.js';
+
+export type {
+  GuardrailRule,
+  GuardrailViolation,
+  GuardrailResult,
+  GuardrailsConfig,
+} from './guardrails.js';

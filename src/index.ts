@@ -159,6 +159,10 @@ export {
   Router,
   createRouter,
   createAgentRoute,
+  Guardrails,
+  createGuardrails,
+  createDefaultGuardrails,
+  builtinRules,
 } from './patterns/index.js';
 
 export type {
@@ -177,4 +181,8 @@ export type {
   RoutingDecision,
   RouterConfig,
   RoutingResult,
+  GuardrailRule,
+  GuardrailViolation,
+  GuardrailResult,
+  GuardrailsConfig,
 } from './patterns/index.js';
