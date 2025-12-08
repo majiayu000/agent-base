@@ -146,3 +146,16 @@ export const allTools: any[] = [
   ..._filesystemTools,
   ..._shellTools,
 ];
+
+// Agentic Design Patterns
+export {
+  Reflection,
+  createReflection,
+  reflectionMiddleware,
+} from './patterns/index.js';
+
+export type {
+  ReflectionConfig,
+  ReflectionResult,
+  EvaluationResult,
+} from './patterns/index.js';
