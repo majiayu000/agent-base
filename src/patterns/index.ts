@@ -123,3 +123,58 @@ export type {
   MultiAgentConfig,
   MultiAgentResult,
 } from './multi-agent.js';
+
+export {
+  KnowledgeBase,
+  createKnowledgeBase,
+  HybridRetriever,
+  createHybridRetriever,
+  Reranker,
+  createReranker,
+} from './rag.js';
+
+export type {
+  Document,
+  Chunk,
+  RetrievalResult,
+  RAGConfig,
+  RAGContext,
+} from './rag.js';
+
+export {
+  Evaluator,
+  createEvaluator,
+  createDefaultEvaluator,
+  Monitor,
+  createMonitor,
+  lengthCriteria,
+  relevanceCriteria,
+  completenessCriteria,
+  formatCriteria,
+  builtinCriteria,
+} from './evaluation.js';
+
+export type {
+  MetricValue,
+  EvaluationCriteria,
+  EvaluationResult,
+  MonitorConfig,
+  MonitorStats,
+} from './evaluation.js';
+
+export {
+  ChainOfThought,
+  TreeOfThought,
+  SelfConsistency,
+  ReActReasoner,
+  createCoT,
+  createToT,
+  createSelfConsistency,
+  createReAct,
+} from './reasoning.js';
+
+export type {
+  ReasoningStep,
+  ReasoningResult,
+  ReasoningConfig,
+} from './reasoning.js';

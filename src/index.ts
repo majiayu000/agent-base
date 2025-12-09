@@ -182,6 +182,33 @@ export {
   SupervisorWorkerPattern,
   PipelinePattern,
   DebatePattern,
+  // RAG
+  KnowledgeBase,
+  createKnowledgeBase,
+  HybridRetriever,
+  createHybridRetriever,
+  Reranker,
+  createReranker,
+  // Evaluation & Monitoring
+  Evaluator,
+  createEvaluator,
+  createDefaultEvaluator,
+  Monitor,
+  createMonitor,
+  lengthCriteria,
+  relevanceCriteria,
+  completenessCriteria,
+  formatCriteria,
+  builtinCriteria,
+  // Reasoning
+  ChainOfThought,
+  TreeOfThought,
+  SelfConsistency,
+  ReActReasoner,
+  createCoT,
+  createToT,
+  createSelfConsistency,
+  createReAct,
 } from './patterns/index.js';
 
 export type {
@@ -221,4 +248,19 @@ export type {
   CoordinationStrategy,
   MultiAgentConfig,
   MultiAgentResult,
+  // RAG
+  Document,
+  Chunk,
+  RetrievalResult,
+  RAGConfig,
+  RAGContext,
+  // Evaluation & Monitoring
+  MetricValue,
+  EvaluationCriteria,
+  MonitorConfig,
+  MonitorStats,
+  // Reasoning
+  ReasoningStep,
+  ReasoningResult,
+  ReasoningConfig,
 } from './patterns/index.js';
