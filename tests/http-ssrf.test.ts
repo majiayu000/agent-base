@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test';
-import { assertSafeHttpUrl, safeFetch } from '../src/utils/url-safety.js';
+import { assertSafeHttpUrl, getSafeFetchUrl, safeFetch } from '../src/utils/url-safety.js';
 import { httpGetTool, httpPostTool, fetchJsonTool } from '../src/tools/http.js';
 
 /**
@@ -64,6 +64,11 @@ describe('assertSafeHttpUrl', () => {
   it('rejects IPv6 loopback and link-local', async () => {
     await expect(assertSafeHttpUrl('https://[::1]/')).rejects.toThrow(/blocked/i);
     await expect(assertSafeHttpUrl('https://[fe80::1]/')).rejects.toThrow(/blocked/i);
+  });
+
+  it('rejects deprecated site-local IPv6 fec0::/10', async () => {
+    await expect(assertSafeHttpUrl('https://[fec0::1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[fed0::1]/')).rejects.toThrow(/blocked/i);
   });
 
   it('rejects numeric hostname smuggling', async () => {
@@ -207,6 +212,86 @@ describe('safeFetch redirect semantics', () => {
       const response = await safeFetch('https://1.1.1.1/pin-check');
       expect(response.status).toBe(200);
       expect(sawPinned).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('brackets IPv6 addresses when pinning Bun requests', async () => {
+    const original = globalThis.fetch;
+    let pinnedHref = '';
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      pinnedHref =
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const headers = new Headers(init?.headers);
+      expect(headers.get('host')).toBe('[2606:4700:4700::1111]');
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://[2606:4700:4700::1111]/ipv6-pin');
+      expect(response.status).toBe(200);
+      expect(pinnedHref).toContain('https://[2606:4700:4700::1111]/');
+      expect(getSafeFetchUrl(response)).toBe('https://[2606:4700:4700::1111]/ipv6-pin');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('preserves PUT across 301/302 but converts POST and all methods on 303', async () => {
+    const calls: Array<{ method?: string; body?: unknown }> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: init?.method, body: init?.body });
+      if (calls.length === 1) {
+        return new Response(null, {
+          status: 301,
+          headers: { Location: 'https://1.0.0.1/after-301' },
+        });
+      }
+      if (calls.length === 2) {
+        return new Response(null, {
+          status: 303,
+          headers: { Location: 'https://1.0.0.1/after-303' },
+        });
+      }
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      await safeFetch('https://1.1.1.1/resource', {
+        method: 'PUT',
+        body: 'payload',
+        headers: { 'Content-Type': 'text/plain' },
+      });
+      expect((calls[0].method ?? 'GET').toUpperCase()).toBe('PUT');
+      // 301 must preserve PUT (unlike POST)
+      expect((calls[1].method ?? 'GET').toUpperCase()).toBe('PUT');
+      expect(calls[1].body).toBe('payload');
+      // 303 converts non-GET/HEAD to GET
+      expect((calls[2].method ?? 'GET').toUpperCase()).toBe('GET');
+      expect(calls[2].body == null || calls[2].body === '').toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('exposes the logical final URL after redirects', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (href.includes('/start')) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'https://1.0.0.1/final' },
+        });
+      }
+      return new Response('done', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://1.1.1.1/start');
+      expect(getSafeFetchUrl(response)).toBe('https://1.0.0.1/final');
     } finally {
       globalThis.fetch = original;
     }

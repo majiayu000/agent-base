@@ -3,6 +3,8 @@ import http from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
+import type { IncomingMessage } from 'node:http';
 
 // ============================================================================
 // URL Safety (SSRF protection)
@@ -26,12 +28,29 @@ const BLOCKED_HOSTNAMES = new Set([
 ]);
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+/** Statuses that must not carry a body in the Web Response constructor. */
+const NULL_BODY_STATUS = new Set([204, 205, 304]);
 const SENSITIVE_HEADERS = new Set([
   'authorization',
   'proxy-authorization',
   'cookie',
   'cookie2',
 ]);
+
+/** Logical request URL for responses produced by safeFetch (WeakMap so Response.url stays transport-native). */
+const logicalResponseUrls = new WeakMap<Response, string>();
+
+/**
+ * Return the logical final URL tracked by safeFetch, falling back to Response.url / fallback.
+ */
+export function getSafeFetchUrl(response: Response, fallback = ''): string {
+  return logicalResponseUrls.get(response) ?? (response.url || fallback);
+}
+
+function stampLogicalUrl(response: Response, logicalUrl: string): Response {
+  logicalResponseUrls.set(response, logicalUrl);
+  return response;
+}
 
 export interface ValidatedSafeUrl {
   url: URL;
@@ -154,7 +173,12 @@ async function lookupAll(
     new Promise<never>((_, reject) => {
       const onAbort = () => reject(abortError(signal.reason));
       signal.addEventListener('abort', onAbort, { once: true });
-      lookupPromise.finally(() => signal.removeEventListener('abort', onAbort));
+      // Clean up the abort listener without leaving finally()'s derived rejection unhandled
+      // when lookupPromise itself rejects (Promise.race already surfaces that rejection).
+      void lookupPromise.then(
+        () => signal.removeEventListener('abort', onAbort),
+        () => signal.removeEventListener('abort', onAbort)
+      );
     }),
   ]);
 }
@@ -257,6 +281,8 @@ function isBlockedIpv6(ip: string): boolean {
   const first = parseInt(full[0], 16);
   // fe80::/10 link-local
   if ((first & 0xffc0) === 0xfe80) return true;
+  // fec0::/10 site-local (deprecated, still routed on some private networks)
+  if ((first & 0xffc0) === 0xfec0) return true;
   // fc00::/7 unique local
   if ((first & 0xfe00) === 0xfc00) return true;
   // ff00::/8 multicast
@@ -304,7 +330,7 @@ export async function safeFetch(
       signal: requestInit.signal ?? urlSafety?.signal,
     });
 
-    const response = await pinnedFetch(validated, requestInit);
+    const response = stampLogicalUrl(await pinnedFetch(validated, requestInit), current);
 
     if (!REDIRECT_STATUS.has(response.status)) {
       return response;
@@ -346,14 +372,18 @@ function nextRedirectInit(
   let method = (init.method ?? 'GET').toUpperCase();
   let body = init.body;
 
-  // Fetch semantics: 301/302/303 convert non-GET/HEAD to GET and drop body.
-  if (status === 301 || status === 302 || status === 303) {
-    if (method !== 'GET' && method !== 'HEAD') {
-      method = 'GET';
-      body = undefined;
-      headers.delete('content-length');
-      headers.delete('content-type');
-    }
+  // Fetch semantics:
+  // - 303: convert any non-GET/HEAD method to GET and drop body
+  // - 301/302: only POST is converted to GET (other methods are preserved)
+  const convertToGet =
+    status === 303
+      ? method !== 'GET' && method !== 'HEAD'
+      : (status === 301 || status === 302) && method === 'POST';
+  if (convertToGet) {
+    method = 'GET';
+    body = undefined;
+    headers.delete('content-length');
+    headers.delete('content-type');
   }
 
   if (crossOrigin) {
@@ -399,13 +429,23 @@ async function pinnedFetch(
   return nodePinnedFetch(validated.url, pinned, init);
 }
 
+function setPinnedHostname(requestUrl: URL, pinned: { address: string; family: number }): void {
+  // URL.hostname ignores bare IPv6 literals; bracket them (or set host) so the pin sticks.
+  if (pinned.family === 6 || isIP(pinned.address) === 6) {
+    const port = requestUrl.port;
+    requestUrl.host = port ? `[${pinned.address}]:${port}` : `[${pinned.address}]`;
+  } else {
+    requestUrl.hostname = pinned.address;
+  }
+}
+
 async function bunPinnedFetch(
   url: URL,
   pinned: { address: string; family: number },
   init: RequestInit
 ): Promise<Response> {
   const requestUrl = new URL(url.href);
-  requestUrl.hostname = pinned.address;
+  setPinnedHostname(requestUrl, pinned);
 
   const headers = new Headers(init.headers);
   if (!headers.has('host')) {
@@ -478,8 +518,22 @@ async function nodePinnedFetch(
           }
         }
 
+        // Web Response rejects bodies for null-body statuses; drain and pass null.
+        if (NULL_BODY_STATUS.has(status)) {
+          res.resume();
+          resolve(
+            new Response(null, {
+              status,
+              statusText: res.statusMessage ?? '',
+              headers: responseHeaders,
+            })
+          );
+          return;
+        }
+
+        const decoded = decodeContentEncoding(res, responseHeaders);
         resolve(
-          new Response(Readable.toWeb(res) as ReadableStream, {
+          new Response(Readable.toWeb(decoded) as ReadableStream, {
             status,
             statusText: res.statusMessage ?? '',
             headers: responseHeaders,
@@ -509,4 +563,28 @@ async function nodePinnedFetch(
     }
     req.end();
   });
+}
+
+/**
+ * Decode Content-Encoding like native Fetch, and strip encoding/length headers once decoded.
+ */
+function decodeContentEncoding(res: IncomingMessage, headers: Headers): Readable {
+  const encoding = String(headers.get('content-encoding') ?? '')
+    .toLowerCase()
+    .trim();
+
+  let stream: Readable = res;
+  if (encoding === 'gzip' || encoding === 'x-gzip') {
+    stream = res.pipe(createGunzip());
+  } else if (encoding === 'deflate') {
+    stream = res.pipe(createInflate());
+  } else if (encoding === 'br') {
+    stream = res.pipe(createBrotliDecompress());
+  } else {
+    return res;
+  }
+
+  headers.delete('content-encoding');
+  headers.delete('content-length');
+  return stream;
 }

@@ -1,5 +1,5 @@
 import { defineTool } from '../core/tool-executor.js';
-import { safeFetch } from '../utils/url-safety.js';
+import { getSafeFetchUrl, safeFetch } from '../utils/url-safety.js';
 
 // ============================================================================
 // HTTP Request Tools
@@ -67,7 +67,7 @@ export const httpGetTool = defineTool<
         statusText: response.statusText,
         headers: responseHeaders,
         body: body.slice(0, 50000), // Limit body size
-        url: response.url || url,
+        url: getSafeFetchUrl(response, url),
         ok: response.ok,
       };
     } finally {
@@ -169,7 +169,7 @@ export const httpPostTool = defineTool<
         statusText: response.statusText,
         headers: responseHeaders,
         body: responseBody.slice(0, 50000),
-        url: response.url || url,
+        url: getSafeFetchUrl(response, url),
         ok: response.ok,
       };
     } finally {
