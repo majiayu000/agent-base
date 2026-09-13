@@ -119,6 +119,7 @@ export {
   assertSafeHttpUrl,
   validateSafeHttpUrl,
   safeFetch,
+  getSafeFetchUrl,
 } from './utils/url-safety.js';
 export type {
   UrlSafetyOptions,

@@ -279,6 +279,7 @@ function isBlockedIpv6(ip: string): boolean {
   if (!full) return true;
 
   const first = parseInt(full[0], 16);
+  const second = parseInt(full[1], 16);
   // fe80::/10 link-local
   if ((first & 0xffc0) === 0xfe80) return true;
   // fec0::/10 site-local (deprecated, still routed on some private networks)
@@ -287,6 +288,19 @@ function isBlockedIpv6(ip: string): boolean {
   if ((first & 0xfe00) === 0xfc00) return true;
   // ff00::/8 multicast
   if ((first & 0xff00) === 0xff00) return true;
+  // 100::/64 discard-only (RFC 6666)
+  if (
+    first === 0x0100 &&
+    second === 0 &&
+    parseInt(full[2], 16) === 0 &&
+    parseInt(full[3], 16) === 0
+  ) {
+    return true;
+  }
+  // 2001:db8::/32 documentation
+  if (first === 0x2001 && second === 0x0db8) return true;
+  // 2001:2::/48 benchmarking
+  if (first === 0x2001 && second === 0x0002 && parseInt(full[2], 16) === 0) return true;
 
   return false;
 }
@@ -306,7 +320,12 @@ function expandIpv6(ip: string): string[] | null {
   return [...head, ...Array(missing).fill('0'), ...tail].map((h) => h.padStart(4, '0'));
 }
 
-export interface SafeFetchOptions extends RequestInit {
+/**
+ * SafeFetch options. `integrity` is omitted from the public type because the Node
+ * pinned transport does not implement Subresource Integrity; Bun still accepts it
+ * via native fetch when callers cast, but SafeFetchOptions does not advertise it.
+ */
+export interface SafeFetchOptions extends Omit<RequestInit, 'integrity' | 'redirect'> {
   /** Max redirects to follow after re-validating each Location. Default: 5. */
   maxRedirects?: number;
   urlSafety?: UrlSafetyOptions;
@@ -321,6 +340,7 @@ export async function safeFetch(
   init: SafeFetchOptions = {}
 ): Promise<Response> {
   const { maxRedirects = 5, urlSafety, ...fetchInit } = init;
+  assertAllowedFetchMethod(normalizeMethod(fetchInit.method));
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
 
@@ -430,7 +450,14 @@ async function serializeNodeBody(
   }
 
   // Request normalizes FormData / Blob / URLSearchParams / ReadableStream.
-  const tmp = new Request('http://local.invalid', { method: 'POST', body });
+  // Node requires duplex:'half' when the body is a ReadableStream.
+  const streamBody =
+    typeof ReadableStream !== 'undefined' && body instanceof ReadableStream;
+  const tmp = new Request('http://local.invalid', {
+    method: 'POST',
+    body,
+    ...(streamBody ? ({ duplex: 'half' } as RequestInit) : {}),
+  });
   const contentType = tmp.headers.get('content-type');
   if (contentType && !headers.has('content-type')) {
     headers.set('content-type', contentType);
@@ -438,10 +465,32 @@ async function serializeNodeBody(
   return Buffer.from(await tmp.arrayBuffer());
 }
 
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE']);
+const FORBIDDEN_FETCH_METHODS = new Set(['CONNECT', 'TRACE']);
+
+function normalizeMethod(method: string | undefined): string {
+  return (method ?? 'GET').toUpperCase();
+}
+
+function assertAllowedFetchMethod(method: string): void {
+  if (FORBIDDEN_FETCH_METHODS.has(method)) {
+    throw new TypeError(`'${method}' HTTP method is unsupported.`);
+  }
+}
+
+function isIdempotentMethod(method: string): boolean {
+  return IDEMPOTENT_METHODS.has(method);
+}
+
 async function pinnedFetch(
   validated: ValidatedSafeUrl,
   init: RequestInit
 ): Promise<Response> {
+  const method = normalizeMethod(
+    typeof init.method === 'string' ? init.method : undefined
+  );
+  assertAllowedFetchMethod(method);
+
   if (!validated.addresses.length) {
     // DNS resolution disabled — fall back to normal fetch (no pin available).
     return fetch(validated.url.href, { ...init, redirect: 'manual' });
@@ -449,9 +498,12 @@ async function pinnedFetch(
 
   const useBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
   let lastError: unknown;
+  const idempotent = isIdempotentMethod(method);
 
-  // Try validated addresses in resolver order; retry after connection failure.
-  for (const pinned of validated.addresses) {
+  // Try validated addresses in resolver order. Only retry after transport errors
+  // for idempotent methods — otherwise a POST/PATCH may have already been processed.
+  for (let i = 0; i < validated.addresses.length; i++) {
+    const pinned = validated.addresses[i];
     try {
       if (useBun) {
         return await bunPinnedFetch(validated.url, pinned, init);
@@ -462,6 +514,12 @@ async function pinnedFetch(
         throw err;
       }
       lastError = err;
+      const moreAddresses = i < validated.addresses.length - 1;
+      if (!idempotent || !moreAddresses) {
+        throw err instanceof Error
+          ? err
+          : new Error(`All validated addresses failed for ${validated.url.hostname}`);
+      }
     }
   }
 
@@ -553,6 +611,16 @@ async function nodePinnedFetch(
       },
       (res) => {
         const status = res.statusCode ?? 0;
+        // Web Response only accepts 200–599; out-of-range values throw synchronously
+        // inside this callback and would terminate the process instead of rejecting.
+        if (status < 200 || status > 599) {
+          res.resume();
+          settle(() =>
+            reject(new Error(`Unsupported HTTP status code from upstream: ${status}`))
+          );
+          return;
+        }
+
         const responseHeaders = new Headers();
         for (const [key, value] of Object.entries(res.headers)) {
           if (value === undefined) continue;
@@ -616,6 +684,15 @@ async function nodePinnedFetch(
       req.destroy();
       settle(() =>
         reject(new Error('Protocol upgrade (101 Switching Protocols) is not supported by safeFetch'))
+      );
+    });
+
+    // CONNECT success emits `connect` rather than `response`/`upgrade`.
+    req.on('connect', (_res, socket) => {
+      socket.destroy();
+      req.destroy();
+      settle(() =>
+        reject(new Error('CONNECT tunneling is not supported by safeFetch'))
       );
     });
 

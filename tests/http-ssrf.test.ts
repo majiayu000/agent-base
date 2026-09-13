@@ -61,6 +61,12 @@ describe('assertSafeHttpUrl', () => {
     ).resolves.toBeInstanceOf(URL);
   });
 
+  it('rejects IPv6 documentation, discard-only, and benchmarking ranges', async () => {
+    await expect(assertSafeHttpUrl('https://[2001:db8::1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[100::1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[2001:2::1]/')).rejects.toThrow(/blocked/i);
+  });
+
   it('rejects IPv6 loopback and link-local', async () => {
     await expect(assertSafeHttpUrl('https://[::1]/')).rejects.toThrow(/blocked/i);
     await expect(assertSafeHttpUrl('https://[fe80::1]/')).rejects.toThrow(/blocked/i);
@@ -331,6 +337,23 @@ describe('safeFetch redirect semantics', () => {
     try {
       const response = await safeFetch('https://1.1.1.1/start');
       expect(getSafeFetchUrl(response)).toBe('https://1.0.0.1/final');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('rejects CONNECT before any network attempt', async () => {
+    const original = globalThis.fetch;
+    const fetchMock = mock(() => {
+      throw new Error('fetch should not be called for CONNECT');
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/', { method: 'CONNECT' })
+      ).rejects.toThrow(/CONNECT/i);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = original;
     }
