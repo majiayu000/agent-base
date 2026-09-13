@@ -1,6 +1,9 @@
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 import { assertSafeHttpUrl, getSafeFetchUrl, safeFetch } from '../src/utils/url-safety.js';
 import { httpGetTool, httpPostTool, fetchJsonTool } from '../src/tools/http.js';
+import https from 'node:https';
+import * as dns from 'node:dns/promises';
+import { EventEmitter } from 'node:events';
 
 /**
  * SSRF guard tests — blocked URLs must fail before any network I/O.
@@ -617,6 +620,116 @@ describe('safeFetch redirect semantics', () => {
       expect(attempts).toBe(1);
     } finally {
       globalThis.fetch = original;
+    }
+  });
+
+  it('strips caller-supplied Content-Length and Transfer-Encoding on Bun pinned path', async () => {
+    const original = globalThis.fetch;
+    let seenHeaders: Headers | null = null;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenHeaders = new Headers(init?.headers);
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      await safeFetch('https://1.1.1.1/framing', {
+        method: 'POST',
+        body: 'hello',
+        headers: {
+          'Content-Length': '0',
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+      expect(seenHeaders).not.toBeNull();
+      expect(seenHeaders!.get('content-length')).toBeNull();
+      expect(seenHeaders!.get('transfer-encoding')).toBeNull();
+      expect(seenHeaders!.get('host')).toBe('1.1.1.1');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('sets Content-Length from Blob.size on the Node pinned path', async () => {
+    let seenHeaders: https.RequestOptions['headers'];
+
+    class FakeRequest extends EventEmitter {
+      destroyed = false;
+      write(_chunk: unknown) {
+        return true;
+      }
+      end() {
+        void Promise.resolve().then(() => {
+          const res = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            statusMessage: string;
+            headers: Record<string, string>;
+            resume: () => void;
+          };
+          res.statusCode = 204;
+          res.statusMessage = 'No Content';
+          res.headers = {};
+          res.resume = () => undefined;
+          this.emit('response', res);
+        });
+      }
+      destroy(err?: Error) {
+        this.destroyed = true;
+        if (err) this.emit('error', err);
+        return this;
+      }
+    }
+
+    // Pin DNS to a public address so local fake-IP resolvers cannot block the host.
+    const lookupSpy = spyOn(dns, 'lookup').mockImplementation((async () => [
+      { address: '1.1.1.1', family: 4 },
+    ]) as typeof dns.lookup);
+
+    // Spy the same default-export object url-safety imports.
+    const requestSpy = spyOn(https, 'request').mockImplementation((
+      options: unknown,
+      cb?: (res: import('node:http').IncomingMessage) => void
+    ) => {
+      const opts =
+        typeof options === 'object' && options !== null && !(options instanceof URL)
+          ? (options as https.RequestOptions)
+          : {};
+      seenHeaders = opts.headers;
+      const req = new FakeRequest();
+      if (typeof cb === 'function') {
+        req.on('response', cb);
+      }
+      return req as unknown as import('node:http').ClientRequest;
+    });
+
+    try {
+      const payload = 'blob-body-bytes';
+      const blob = new Blob([payload], { type: 'text/plain' });
+      const response = await safeFetch('https://example.com/blob-upload', {
+        method: 'POST',
+        body: blob,
+        headers: {
+          // Caller framing must be ignored; length comes from Blob.size.
+          'Content-Length': '0',
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+      expect(response.status).toBe(204);
+      expect(seenHeaders).toBeDefined();
+      const headers = new Headers(
+        Object.entries(seenHeaders ?? {}).flatMap(([key, value]) => {
+          if (value === undefined) return [];
+          if (Array.isArray(value)) return value.map((v) => [key, v] as [string, string]);
+          return [[key, String(value)] as [string, string]];
+        })
+      );
+      expect(headers.get('content-length')).toBe(String(blob.size));
+      expect(headers.get('transfer-encoding')).toBeNull();
+      expect(headers.get('host')).toBe('example.com');
+      expect(headers.get('content-type')).toBe(blob.type || 'text/plain');
+      expect(requestSpy).toHaveBeenCalled();
+    } finally {
+      requestSpy.mockRestore();
+      lookupSpy.mockRestore();
     }
   });
 });

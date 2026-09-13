@@ -640,7 +640,12 @@ function stripIpv6Brackets(hostname: string): string {
 
 type PreparedNodeBody =
   | { kind: 'buffer'; value: string | Buffer }
-  | { kind: 'stream'; stream: ReadableStream<Uint8Array> };
+  | {
+      kind: 'stream';
+      stream: ReadableStream<Uint8Array>;
+      /** Known byte length (e.g. Blob.size) so framing can use Content-Length. */
+      contentLength?: number;
+    };
 
 /**
  * Prepare RequestInit body forms for the Node http(s) transport.
@@ -681,11 +686,17 @@ async function prepareNodeBody(
   }
 
   // Stream Blob/File uploads instead of buffering the entire payload.
+  // Retain Blob.size so the transport can set a trusted Content-Length
+  // instead of forcing chunked Transfer-Encoding.
   if (typeof Blob !== 'undefined' && body instanceof Blob) {
     if (body.type && !headers.has('content-type')) {
       headers.set('content-type', body.type);
     }
-    return { kind: 'stream', stream: body.stream() as ReadableStream<Uint8Array> };
+    return {
+      kind: 'stream',
+      stream: body.stream() as ReadableStream<Uint8Array>,
+      contentLength: body.size,
+    };
   }
 
   // FormData / URLSearchParams: encode via Request, then stream the body when available.
@@ -913,6 +924,11 @@ async function bunPinnedFetch(
   headers.set('host', url.host);
   applyReferrerHeaders(headers, url, init);
 
+  // Never trust caller-supplied framing — Bun may add Content-Length while preserving
+  // a caller Transfer-Encoding, producing CL+TE ambiguity that proxies can smuggle.
+  headers.delete('content-length');
+  headers.delete('transfer-encoding');
+
   const fetchInit: RequestInit & { tls?: { serverName: string } } = {
     ...init,
     headers,
@@ -948,8 +964,12 @@ async function nodePinnedFetch(
   headers.delete('transfer-encoding');
   if (body?.kind === 'buffer') {
     headers.set('content-length', String(Buffer.byteLength(body.value)));
+  } else if (body?.kind === 'stream' && typeof body.contentLength === 'number') {
+    // Known-size streams (Blob/File): regenerate trusted Content-Length so uploads
+    // are not forced into chunked encoding.
+    headers.set('content-length', String(body.contentLength));
   }
-  // Streaming bodies: omit Content-Length so Node uses chunked transfer automatically.
+  // Unknown-size streams: omit Content-Length so Node uses chunked transfer.
 
   const headerObject: Record<string, string> = {};
   headers.forEach((value, key) => {
