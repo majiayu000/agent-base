@@ -36,11 +36,28 @@ export interface ShellSecurityPolicy {
 }
 
 /**
+ * Strong file identity captured at pin time so an in-place binary replacement
+ * (same pathname / realpath) cannot satisfy the allowlist after resolve.
+ */
+export interface PinnedFileIdentity {
+  /** Filesystem device id from `stat.dev`. */
+  dev: number;
+  /** Inode from `stat.ino`. */
+  ino: number;
+  /** Byte size from `stat.size`. */
+  size: number;
+  /** Modification time in milliseconds from `stat.mtimeMs`. */
+  mtimeMs: number;
+}
+
+/**
  * Allowlist entry pinned at policy resolve time.
  *
  * Path-qualified entries bind both the authorized invocation basename (BusyBox
  * multicall applet name) and the canonical target. Bare names also capture the
  * trusted-PATH spawn path so later PATH changes cannot authorize a different binary.
+ * Both forms also pin file identity (dev/ino/size/mtime) to reject in-place
+ * replacements that preserve the pathname.
  */
 export interface AllowedCommandPin {
   /** Authorized invocation basename (e.g. `ls`, not `sh` on a shared BusyBox). */
@@ -53,6 +70,8 @@ export interface AllowedCommandPin {
    * basename + canonical target match).
    */
   pinnedSpawnPath?: string;
+  /** File identity of the authorized binary at pin time (absent when unresolvable). */
+  identity?: PinnedFileIdentity;
 }
 
 export interface ResolvedShellSecurityPolicy {
@@ -74,11 +93,13 @@ export interface ResolvedShellSecurityPolicy {
 
 /**
  * Matches credential-like env keys: exact unprefixed names, common suffixes,
- * mid-key SECRET / PASSWORD / ACCESS_KEY, and auth/JWT/private-key forms
- * (e.g. DOCKER_AUTH_CONFIG, CI_JOB_JWT, SSH_PRIVATE_KEY, NPM_CONFIG__AUTH).
+ * mid-key SECRET / PASSWORD / ACCESS_KEY, auth/JWT/private-key forms
+ * (e.g. DOCKER_AUTH_CONFIG, CI_JOB_JWT, SSH_PRIVATE_KEY, NPM_CONFIG__AUTH),
+ * and connection URL / connection-string forms (DATABASE_URL,
+ * AZURE_STORAGE_CONNECTION_STRING).
  */
 const SECRET_ENV_KEY =
-  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET|_AUTH|_JWT)|SECRET|PASSWORD|ACCESS_KEY|PRIVATE_KEY|AUTH_CONFIG|(^|_)JWT(_|$)|CREDENTIAL/i;
+  /^(API_KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL|CONNECTION_STRING)$|(_API_KEY|_TOKEN|_SECRET|_AUTH|_JWT|_CONNECTION_STRING|_DATABASE_URL)|SECRET|PASSWORD|ACCESS_KEY|PRIVATE_KEY|AUTH_CONFIG|CONNECTION_STRING|DATABASE_URL|(^|_)JWT(_|$)|CREDENTIAL/i;
 
 /** Env keys that can load/execute attacker-controlled code in child processes. */
 const DANGEROUS_ENV_KEYS = new Set(
@@ -113,9 +134,54 @@ const DANGEROUS_ENV_KEYS = new Set(
   ].map((k) => k.toUpperCase())
 );
 
+/** Capture durable file identity used to detect in-place binary replacement. */
+export function captureFileIdentity(filePath: string): PinnedFileIdentity | undefined {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return undefined;
+    return {
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when the live file still matches the identity pinned at policy resolve. */
+export function fileIdentityMatches(
+  filePath: string,
+  expected: PinnedFileIdentity | undefined
+): boolean {
+  if (!expected) return false;
+  const live = captureFileIdentity(filePath);
+  if (!live) return false;
+  return (
+    live.dev === expected.dev &&
+    live.ino === expected.ino &&
+    live.size === expected.size &&
+    live.mtimeMs === expected.mtimeMs
+  );
+}
+
+/** Compare allowlist/invocation names; Windows is case-insensitive. */
+export function commandNamesMatch(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (platform === 'win32') {
+    return left.toLowerCase() === right.toLowerCase();
+  }
+  return left === right;
+}
+
 /**
  * Pin a single allowlist entry against the trusted PATH / filesystem.
  * Path entries bind basename + canonical target; bare names capture spawn path.
+ * Both also pin file identity so in-place replacements are rejected later.
  */
 export function pinAllowedCommand(
   entry: string,
@@ -123,9 +189,11 @@ export function pinAllowedCommand(
 ): AllowedCommandPin {
   if (commandHasPathSeparator(entry)) {
     const absolute = path.resolve(entry);
+    const canonicalPath = tryRealpath(absolute);
     return {
       name: path.basename(absolute),
-      canonicalPath: tryRealpath(absolute),
+      canonicalPath,
+      identity: captureFileIdentity(canonicalPath),
     };
   }
   const found = lookupExecutableOnTrustedPath(entry, trustedPathEnv);
@@ -137,10 +205,12 @@ export function pinAllowedCommand(
       pinnedSpawnPath: '',
     };
   }
+  const canonicalPath = tryRealpath(found);
   return {
     name: entry,
-    canonicalPath: tryRealpath(found),
+    canonicalPath,
     pinnedSpawnPath: found,
+    identity: captureFileIdentity(canonicalPath),
   };
 }
 
@@ -365,7 +435,8 @@ export function resolveAllowedCommand(
       (pin) =>
         pin.pinnedSpawnPath === undefined &&
         pin.canonicalPath === canonicalPath &&
-        pin.name === invName
+        commandNamesMatch(pin.name, invName) &&
+        fileIdentityMatches(canonicalPath, pin.identity)
     );
     if (!matched) {
       throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
@@ -375,7 +446,9 @@ export function resolveAllowedCommand(
 
   // Bare name: use the PATH identity pinned at policy resolve — do not re-lookup.
   const pin = pins.find(
-    (entry) => entry.pinnedSpawnPath !== undefined && entry.name === command
+    (entry) =>
+      entry.pinnedSpawnPath !== undefined &&
+      commandNamesMatch(entry.name, command)
   );
   if (!pin || !pin.pinnedSpawnPath) {
     throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
@@ -388,6 +461,10 @@ export function resolveAllowedCommand(
   const canonicalPath = tryRealpath(pin.pinnedSpawnPath);
   if (canonicalPath !== pin.canonicalPath) {
     // Symlink at the pinned spawn path was retargeted after policy resolve.
+    throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
+  }
+  // In-place binary replacement keeps the same pathname / realpath; reject it.
+  if (!fileIdentityMatches(canonicalPath, pin.identity)) {
     throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
   }
   return pin.pinnedSpawnPath;
@@ -711,53 +788,55 @@ export function createShellRunTool(
 }
 
 /**
- * Check if a command exists
+ * Create a command_exists tool that uses filesystem PATH lookup only.
+ * Never spawns `which`/`where`, so writable PATH entries cannot hijack the helper.
  */
-export const commandExistsTool = defineTool<
-  { command: string },
-  { command: string; exists: boolean; path?: string }
->({
-  name: 'command_exists',
-  description: 'Check if a command is available in the system PATH.',
-  parameters: {
-    type: 'object',
-    properties: {
-      command: {
-        type: 'string',
-        description: 'The command name to check (e.g., "git", "node", "python")',
+export function createCommandExistsTool(
+  policy: ShellSecurityPolicy = {}
+): Tool<{ command: string }, { command: string; exists: boolean; path?: string }> {
+  // Capture trusted PATH at tool creation so later PATH overlays cannot widen lookup.
+  // Policy is accepted for factory consistency with the other shell tools.
+  void policy;
+  const trustedPathEnv = process.env.PATH ?? '';
+
+  return defineTool({
+    name: 'command_exists',
+    description:
+      'Check if a command is available on the trusted process PATH using filesystem lookup (no which/where spawn).',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The command name to check (e.g., "git", "node", "python")',
+        },
       },
+      required: ['command'],
     },
-    required: ['command'],
-  },
-  execute: async ({ command }) => {
-    const whichCommand = process.platform === 'win32' ? 'where' : 'which';
-
-    return new Promise<{ command: string; exists: boolean; path?: string }>((resolve) => {
-      const child = spawn(whichCommand, [command], { shell: false });
-      let stdout = '';
-
-      child.stdout.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      child.on('close', (code) => {
-        if (code === 0 && stdout.trim()) {
-          resolve({
-            command,
-            exists: true,
-            path: stdout.trim().split('\n')[0],
-          });
-        } else {
-          resolve({ command, exists: false });
+    execute: async ({ command }) => {
+      if (!command || !command.trim() || commandHasParentTraversal(command)) {
+        return { command, exists: false };
+      }
+      if (commandHasPathSeparator(command)) {
+        const absolute = path.resolve(command);
+        if (isRunnableFile(absolute)) {
+          return { command, exists: true, path: absolute };
         }
-      });
+        return { command, exists: false };
+      }
+      const found = lookupExecutableOnTrustedPath(command, trustedPathEnv);
+      if (found) {
+        return { command, exists: true, path: found };
+      }
+      return { command, exists: false };
+    },
+  });
+}
 
-      child.on('error', () => {
-        resolve({ command, exists: false });
-      });
-    });
-  },
-});
+/**
+ * Check if a command exists (filesystem lookup; no which/where spawn).
+ */
+export const commandExistsTool = createCommandExistsTool();
 
 /**
  * Build shell tools under an explicit security policy (opt-in allowlists).
@@ -767,7 +846,7 @@ export function createShellTools(policy: ShellSecurityPolicy = {}): Tool<any, an
   return [
     createShellExecTool(policy),
     createShellRunTool(policy),
-    commandExistsTool,
+    createCommandExistsTool(policy),
   ];
 }
 

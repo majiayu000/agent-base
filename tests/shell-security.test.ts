@@ -20,6 +20,9 @@ import {
   resolvePathForJail,
   commandHasParentTraversal,
   getCliSafeAllowedCommands,
+  createCommandExistsTool,
+  captureFileIdentity,
+  commandNamesMatch,
 } from '../src/tools/shell.js';
 
 describe('Shell security (SEC-07)', () => {
@@ -100,6 +103,8 @@ describe('Shell security (SEC-07)', () => {
     it('allows allowlisted names that contain adjacent dots but not a .. segment', () => {
       expect(commandHasParentTraversal('my..tool')).toBe(false);
       expect(commandHasParentTraversal('/opt/bin/tool..v2')).toBe(false);
+      // Extensionless shebang fixtures are not runnable under the win32 .exe/.com rule.
+      if (process.platform === 'win32') return;
       const dottedDir = path.join(tmpRoot, 'dotted-bin');
       fs.mkdirSync(dottedDir, { recursive: true });
       const toolPath = path.join(dottedDir, 'my..tool');
@@ -142,6 +147,7 @@ describe('Shell security (SEC-07)', () => {
     });
 
     it('pins path-qualified allowlist entries at policy resolve against retargeting', async () => {
+      if (process.platform === 'win32') return;
       const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-'));
       const goodDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-good-'));
       const evilDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-evil-'));
@@ -163,12 +169,13 @@ describe('Shell security (SEC-07)', () => {
         allowedCommands: [linkPath],
         allowedCwdRoots: [tmpRoot],
       });
-      expect(pinned.allowedCommands).toEqual([
-        {
-          name: 'tool',
-          canonicalPath: fs.realpathSync(goodBin),
-        },
-      ]);
+      expect(pinned.allowedCommands[0]).toMatchObject({
+        name: 'tool',
+        canonicalPath: fs.realpathSync(goodBin),
+      });
+      expect(pinned.allowedCommands[0].identity).toEqual(
+        captureFileIdentity(fs.realpathSync(goodBin))
+      );
 
       const exec = createShellExecTool({
         allowedCommands: [linkPath],
@@ -195,6 +202,40 @@ describe('Shell security (SEC-07)', () => {
       fs.rmSync(linkDir, { recursive: true, force: true });
       fs.rmSync(goodDir, { recursive: true, force: true });
       fs.rmSync(evilDir, { recursive: true, force: true });
+    });
+
+    it('rejects in-place binary replacement after allowlist pin', async () => {
+      if (process.platform === 'win32') return;
+      const pinDir = path.join(tmpRoot, 'inplace-pin');
+      fs.mkdirSync(pinDir, { recursive: true });
+      const toolPath = path.join(pinDir, 'mytool');
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho original\n', { mode: 0o755 });
+
+      const prevPath = process.env.PATH;
+      process.env.PATH = `${pinDir}${path.delimiter}${prevPath ?? ''}`;
+      let exec;
+      try {
+        exec = createShellExecTool({
+          allowedCommands: ['mytool'],
+          allowedCwdRoots: [tmpRoot],
+        });
+      } finally {
+        if (prevPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = prevPath;
+        }
+      }
+
+      const ok = await exec!.execute({ command: 'mytool', cwd: tmpRoot });
+      expect(ok.exitCode).toBe(0);
+      expect(ok.stdout.trim()).toBe('original');
+
+      // Same pathname, different contents/mtime → must be rejected.
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho replaced\n', { mode: 0o755 });
+      await expect(
+        exec!.execute({ command: 'mytool', cwd: tmpRoot })
+      ).rejects.toThrow(/not allowlisted/);
     });
 
     it('preserves symlink spawn path so argv[0] multicalls keep working', async () => {
@@ -270,6 +311,7 @@ describe('Shell security (SEC-07)', () => {
     });
 
     it('pins bare allowlist names at policy resolve against later PATH changes', async () => {
+      if (process.platform === 'win32') return;
       const goodDir = path.join(tmpRoot, 'bare-pin-good');
       const evilDir = path.join(tmpRoot, 'bare-pin-evil');
       fs.mkdirSync(goodDir, { recursive: true });
@@ -291,11 +333,14 @@ describe('Shell security (SEC-07)', () => {
           allowedCommands: ['mytool'],
           allowedCwdRoots: [tmpRoot],
         });
-        expect(pinned.allowedCommands[0]).toEqual({
+        expect(pinned.allowedCommands[0]).toMatchObject({
           name: 'mytool',
           canonicalPath: fs.realpathSync(goodBin),
           pinnedSpawnPath: path.resolve(goodBin),
         });
+        expect(pinned.allowedCommands[0].identity).toEqual(
+          captureFileIdentity(fs.realpathSync(goodBin))
+        );
       } finally {
         // Flip PATH so a naive re-lookup would pick evil first.
         process.env.PATH = `${evilDir}${path.delimiter}${prevPath ?? ''}`;
@@ -317,7 +362,23 @@ describe('Shell security (SEC-07)', () => {
       }
     });
 
+    it('matches Windows allowlist names case-insensitively', () => {
+      expect(commandNamesMatch('whoami', 'WHOAMI', 'win32')).toBe(true);
+      expect(commandNamesMatch('whoami', 'WhoAmi', 'win32')).toBe(true);
+      expect(commandNamesMatch('whoami', 'WHOAMI', 'darwin')).toBe(false);
+      expect(commandNamesMatch('whoami', 'whoami', 'darwin')).toBe(true);
+      if (process.platform !== 'win32') return;
+      const resolved = resolveAllowedCommand(
+        'WHOAMI',
+        ['whoami'],
+        process.env.PATH ?? '',
+        tmpRoot
+      );
+      expect(resolved.toLowerCase()).toContain('whoami');
+    });
+
     it('runs relative allowlisted executable with explicit cwd', async () => {
+      if (process.platform === 'win32') return;
       const binDir = path.join(tmpRoot, 'rel-bin');
       fs.mkdirSync(binDir, { recursive: true });
       const toolPath = path.join(binDir, 'tool');
@@ -337,6 +398,7 @@ describe('Shell security (SEC-07)', () => {
     });
 
     it('ignores caller PATH overlay when resolving and spawning', async () => {
+      if (process.platform === 'win32') return;
       const decoyDir = path.join(tmpRoot, 'path-hijack');
       fs.mkdirSync(decoyDir, { recursive: true });
       const decoy = path.join(decoyDir, 'echo');
@@ -354,6 +416,63 @@ describe('Shell security (SEC-07)', () => {
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe('trusted');
+    });
+  });
+
+  describe('command_exists filesystem lookup', () => {
+    it('resolves via trusted PATH without spawning which/where', async () => {
+      if (process.platform === 'win32') return;
+      const binDir = path.join(tmpRoot, 'exists-bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const toolPath = path.join(binDir, 'exists-tool');
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho yes\n', { mode: 0o755 });
+
+      const prevPath = process.env.PATH;
+      process.env.PATH = `${binDir}${path.delimiter}${prevPath ?? ''}`;
+      try {
+        const tool = createCommandExistsTool();
+        const hit = await tool.execute({ command: 'exists-tool' });
+        expect(hit.exists).toBe(true);
+        expect(hit.path).toBe(path.resolve(toolPath));
+        const miss = await tool.execute({ command: 'definitely-missing-xyz' });
+        expect(miss.exists).toBe(false);
+      } finally {
+        if (prevPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = prevPath;
+        }
+      }
+    });
+
+    it('does not re-resolve against a PATH overwritten after tool creation', async () => {
+      if (process.platform === 'win32') return;
+      const goodDir = path.join(tmpRoot, 'exists-good');
+      const evilDir = path.join(tmpRoot, 'exists-evil');
+      fs.mkdirSync(goodDir, { recursive: true });
+      fs.mkdirSync(evilDir, { recursive: true });
+      fs.writeFileSync(path.join(goodDir, 'probe'), '#!/bin/sh\necho good\n', {
+        mode: 0o755,
+      });
+      fs.writeFileSync(path.join(evilDir, 'probe'), '#!/bin/sh\necho evil\n', {
+        mode: 0o755,
+      });
+
+      const prevPath = process.env.PATH;
+      process.env.PATH = `${goodDir}${path.delimiter}${prevPath ?? ''}`;
+      const tool = createCommandExistsTool();
+      process.env.PATH = `${evilDir}${path.delimiter}${prevPath ?? ''}`;
+      try {
+        const hit = await tool.execute({ command: 'probe' });
+        expect(hit.exists).toBe(true);
+        expect(hit.path).toBe(path.resolve(goodDir, 'probe'));
+      } finally {
+        if (prevPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = prevPath;
+        }
+      }
     });
   });
 
@@ -507,6 +626,9 @@ describe('Shell security (SEC-07)', () => {
       expect(isSecretEnvKey('NPM_CONFIG__AUTH')).toBe(true);
       expect(isSecretEnvKey('CI_JOB_JWT')).toBe(true);
       expect(isSecretEnvKey('SSH_PRIVATE_KEY')).toBe(true);
+      expect(isSecretEnvKey('DATABASE_URL')).toBe(true);
+      expect(isSecretEnvKey('AZURE_STORAGE_CONNECTION_STRING')).toBe(true);
+      expect(isSecretEnvKey('MY_CONNECTION_STRING')).toBe(true);
       expect(isSecretEnvKey('PATH')).toBe(false);
       expect(isSecretEnvKey('HOME')).toBe(false);
     });
@@ -523,9 +645,11 @@ describe('Shell security (SEC-07)', () => {
       const prev = process.env.TEST_HARNESS_API_KEY;
       const prevAws = process.env.AWS_SECRET_ACCESS_KEY;
       const prevDocker = process.env.DOCKER_AUTH_CONFIG;
+      const prevDb = process.env.DATABASE_URL;
       process.env.TEST_HARNESS_API_KEY = 'super-secret';
       process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
       process.env.DOCKER_AUTH_CONFIG = 'docker-auth';
+      process.env.DATABASE_URL = 'postgres://user:password@host/db';
       try {
         const env = buildChildEnv(
           {
@@ -537,6 +661,7 @@ describe('Shell security (SEC-07)', () => {
             NPM_CONFIG__AUTH: 'npm-auth',
             CI_JOB_JWT: 'ci-jwt',
             SSH_PRIVATE_KEY: 'ssh-key',
+            AZURE_STORAGE_CONNECTION_STRING: 'azure-conn',
             LD_PRELOAD: '/tmp/evil.so',
             NODE_OPTIONS: '--require /tmp/evil.js',
             PATH: '/tmp/attacker',
@@ -549,6 +674,8 @@ describe('Shell security (SEC-07)', () => {
         expect(env.NPM_CONFIG__AUTH).toBeUndefined();
         expect(env.CI_JOB_JWT).toBeUndefined();
         expect(env.SSH_PRIVATE_KEY).toBeUndefined();
+        expect(env.DATABASE_URL).toBeUndefined();
+        expect(env.AZURE_STORAGE_CONNECTION_STRING).toBeUndefined();
         expect(env.OTHER_TOKEN).toBeUndefined();
         expect(env.API_KEY).toBeUndefined();
         expect(env.TOKEN).toBeUndefined();
@@ -572,6 +699,11 @@ describe('Shell security (SEC-07)', () => {
           delete process.env.DOCKER_AUTH_CONFIG;
         } else {
           process.env.DOCKER_AUTH_CONFIG = prevDocker;
+        }
+        if (prevDb === undefined) {
+          delete process.env.DATABASE_URL;
+        } else {
+          process.env.DATABASE_URL = prevDb;
         }
       }
     });
@@ -671,6 +803,21 @@ describe('Shell security (SEC-07)', () => {
 
   describe('allowlisted success path', () => {
     it('runs allowlisted command with safe cwd', async () => {
+      if (process.platform === 'win32') {
+        const tools = createShellTools({
+          allowedCommands: ['whoami'],
+          allowedCwdRoots: [tmpRoot],
+          allowShellRun: false,
+        });
+        const exec = tools[0];
+        const result = await exec.execute({
+          command: 'whoami',
+          cwd: tmpRoot,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.killed).toBe(false);
+        return;
+      }
       const tools = createShellTools({
         allowedCommands: ['echo'],
         allowedCwdRoots: [tmpRoot],
