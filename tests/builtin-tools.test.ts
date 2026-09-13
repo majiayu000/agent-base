@@ -36,6 +36,30 @@ describe('Built-in Tools', () => {
     it('should reject invalid expressions', async () => {
       await expect(calculatorTool.execute({ expression: 'invalid!' })).rejects.toThrow();
     });
+
+    it('should reject process.exit injection', async () => {
+      await expect(
+        calculatorTool.execute({ expression: 'process.exit(1)' })
+      ).rejects.toThrow();
+    });
+
+    it('should reject require fs injection', async () => {
+      await expect(
+        calculatorTool.execute({ expression: "require('fs')" })
+      ).rejects.toThrow();
+    });
+
+    it('should reject Function constructor abuse', async () => {
+      await expect(
+        calculatorTool.execute({ expression: 'Function("return 1")()' })
+      ).rejects.toThrow();
+    });
+
+    it('should reject globalThis access', async () => {
+      await expect(
+        calculatorTool.execute({ expression: 'globalThis.process' })
+      ).rejects.toThrow();
+    });
   });
 
   describe('currentTimeTool', () => {

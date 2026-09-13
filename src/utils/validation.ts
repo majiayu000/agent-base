@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { Tool, ToolSchema, ToolParameter } from '../core/types.js';
+import { safeEvaluateMathExpression } from './safe-math.js';
 
 // ============================================================================
 // Zod-based Tool Validation
@@ -177,21 +178,7 @@ export const validatedCalculatorTool = createValidatedTool({
     precision: z.number().int().min(0).max(20).optional().describe('Decimal precision for result'),
   }),
   execute: async ({ expression, precision = 10 }) => {
-    const safeExpression = expression
-      .replace(/\^/g, '**')
-      .replace(/sqrt/g, 'Math.sqrt')
-      .replace(/sin/g, 'Math.sin')
-      .replace(/cos/g, 'Math.cos')
-      .replace(/tan/g, 'Math.tan')
-      .replace(/log/g, 'Math.log')
-      .replace(/abs/g, 'Math.abs')
-      .replace(/PI/g, 'Math.PI');
-
-    const result = new Function(`return ${safeExpression}`)();
-
-    if (typeof result !== 'number' || !isFinite(result)) {
-      throw new Error('Expression did not evaluate to a valid number');
-    }
+    const result = safeEvaluateMathExpression(expression);
 
     return {
       expression,

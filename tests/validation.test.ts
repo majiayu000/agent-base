@@ -7,7 +7,9 @@ import {
   formatValidationError,
   safeParse,
   commonSchemas,
+  validatedCalculatorTool,
 } from '../src/utils/validation.js';
+import { safeEvaluateMathExpression } from '../src/utils/safe-math.js';
 import { defineTool } from '../src/core/tool-executor.js';
 
 describe('Validation Utils', () => {
@@ -204,6 +206,55 @@ describe('Validation Utils', () => {
       expect(commonSchemas.timeout.safeParse(5000).success).toBe(true);
       expect(commonSchemas.timeout.safeParse(50).success).toBe(false); // too low
       expect(commonSchemas.timeout.safeParse(500000).success).toBe(false); // too high
+    });
+  });
+
+  describe('safeEvaluateMathExpression', () => {
+    it('should evaluate arithmetic and functions', () => {
+      expect(safeEvaluateMathExpression('2 + 3 * 4')).toBe(14);
+      expect(safeEvaluateMathExpression('2^10')).toBe(1024);
+      expect(safeEvaluateMathExpression('sqrt(16)')).toBe(4);
+      expect(safeEvaluateMathExpression('PI * 2')).toBeCloseTo(Math.PI * 2);
+      expect(safeEvaluateMathExpression('abs(-5)')).toBe(5);
+      expect(safeEvaluateMathExpression('floor(3.9)')).toBe(3);
+    });
+
+    it('should reject process.exit injection', () => {
+      expect(() => safeEvaluateMathExpression('process.exit(1)')).toThrow();
+    });
+
+    it('should reject require fs injection', () => {
+      expect(() => safeEvaluateMathExpression("require('fs')")).toThrow();
+    });
+
+    it('should reject Function constructor abuse', () => {
+      expect(() => safeEvaluateMathExpression('Function("return this")()')).toThrow();
+    });
+
+    it('should reject constructor prototype abuse', () => {
+      expect(() => safeEvaluateMathExpression('constructor.constructor("return 1")()')).toThrow();
+    });
+  });
+
+  describe('validatedCalculatorTool', () => {
+    it('should evaluate valid expressions with precision', async () => {
+      const result = await validatedCalculatorTool.execute({
+        expression: 'PI',
+        precision: 4,
+      });
+      expect(result.result).toBe(3.1416);
+    });
+
+    it('should reject code injection payloads', async () => {
+      await expect(
+        validatedCalculatorTool.execute({ expression: 'process.exit(1)' })
+      ).rejects.toThrow();
+      await expect(
+        validatedCalculatorTool.execute({ expression: "require('fs')" })
+      ).rejects.toThrow();
+      await expect(
+        validatedCalculatorTool.execute({ expression: 'Function("return 1")()' })
+      ).rejects.toThrow();
     });
   });
 });

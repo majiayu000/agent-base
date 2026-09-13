@@ -1,4 +1,5 @@
 import { defineTool } from '../core/tool-executor.js';
+import { safeEvaluateMathExpression } from '../utils/safe-math.js';
 
 // ============================================================================
 // Built-in Example Tools
@@ -24,34 +25,10 @@ export const calculatorTool = defineTool<
     required: ['expression'],
   },
   execute: async ({ expression }) => {
-    // Safe math evaluation using Function constructor
-    // Replace common math functions with Math equivalents
-    const safeExpression = expression
-      .replace(/\^/g, '**')
-      .replace(/sqrt/g, 'Math.sqrt')
-      .replace(/sin/g, 'Math.sin')
-      .replace(/cos/g, 'Math.cos')
-      .replace(/tan/g, 'Math.tan')
-      .replace(/log/g, 'Math.log')
-      .replace(/abs/g, 'Math.abs')
-      .replace(/floor/g, 'Math.floor')
-      .replace(/ceil/g, 'Math.ceil')
-      .replace(/round/g, 'Math.round')
-      .replace(/PI/g, 'Math.PI')
-      .replace(/E/g, 'Math.E');
-
-    // Validate expression contains only allowed characters
-    if (!/^[\d\s+\-*/%().Math,sqrtincoabfleurndPIE]+$/.test(safeExpression)) {
-      throw new Error(`Invalid characters in expression: ${expression}`);
-    }
-
     try {
-      const result = new Function(`return ${safeExpression}`)();
-      if (typeof result !== 'number' || !isFinite(result)) {
-        throw new Error('Expression did not evaluate to a valid number');
-      }
+      const result = safeEvaluateMathExpression(expression);
       return { result, expression };
-    } catch (error) {
+    } catch {
       throw new Error(`Failed to evaluate expression: ${expression}`);
     }
   },

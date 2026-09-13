@@ -114,6 +114,9 @@ export {
   validatedCalculatorTool,
 } from './utils/validation.js';
 
+// Utilities - Safe math
+export { safeEvaluateMathExpression } from './utils/safe-math.js';
+
 // Utilities - Token Tracker
 export {
   TokenTracker,
