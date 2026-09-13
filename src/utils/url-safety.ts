@@ -405,28 +405,69 @@ async function cancelResponseBody(response: Response): Promise<void> {
   await response.body.cancel().catch(() => undefined);
 }
 
-function preferAddress(
-  addresses: { address: string; family: number }[]
-): { address: string; family: number } | undefined {
-  return addresses.find((a) => a.family === 4) ?? addresses[0];
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.replace(/^\[|\]$/g, '');
+}
+
+/**
+ * Serialize RequestInit body forms for the Node http(s) transport.
+ * Uses Request to normalize URLSearchParams/FormData/Blob/ArrayBuffer/views.
+ */
+async function serializeNodeBody(
+  body: BodyInit | null | undefined,
+  headers: Headers
+): Promise<string | Buffer | undefined> {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === 'string' || Buffer.isBuffer(body)) return body;
+  if (body instanceof Uint8Array) return Buffer.from(body);
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) {
+    return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  }
+
+  // Request normalizes FormData / Blob / URLSearchParams / ReadableStream.
+  const tmp = new Request('http://local.invalid', { method: 'POST', body });
+  const contentType = tmp.headers.get('content-type');
+  if (contentType && !headers.has('content-type')) {
+    headers.set('content-type', contentType);
+  }
+  return Buffer.from(await tmp.arrayBuffer());
 }
 
 async function pinnedFetch(
   validated: ValidatedSafeUrl,
   init: RequestInit
 ): Promise<Response> {
-  const pinned = preferAddress(validated.addresses);
-  if (!pinned) {
+  if (!validated.addresses.length) {
     // DNS resolution disabled — fall back to normal fetch (no pin available).
     return fetch(validated.url.href, { ...init, redirect: 'manual' });
   }
 
-  // Bun: connect by validated IP while preserving Host + TLS server name.
-  if (typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined') {
-    return bunPinnedFetch(validated.url, pinned, init);
+  const useBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+  let lastError: unknown;
+
+  // Try validated addresses in resolver order; retry after connection failure.
+  for (const pinned of validated.addresses) {
+    try {
+      if (useBun) {
+        return await bunPinnedFetch(validated.url, pinned, init);
+      }
+      return await nodePinnedFetch(validated.url, pinned, init);
+    } catch (err) {
+      if (isAbortError(err) || init.signal?.aborted) {
+        throw err;
+      }
+      lastError = err;
+    }
   }
 
-  return nodePinnedFetch(validated.url, pinned, init);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`All validated addresses failed for ${validated.url.hostname}`);
 }
 
 function setPinnedHostname(requestUrl: URL, pinned: { address: string; family: number }): void {
@@ -448,16 +489,15 @@ async function bunPinnedFetch(
   setPinnedHostname(requestUrl, pinned);
 
   const headers = new Headers(init.headers);
-  if (!headers.has('host')) {
-    headers.set('host', url.host);
-  }
+  // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
+  headers.set('host', url.host);
 
   return fetch(requestUrl.href, {
     ...init,
     headers,
     redirect: 'manual',
     // Bun-specific: keep SNI/certificate validation on the original hostname.
-    tls: { serverName: url.hostname },
+    tls: { serverName: stripIpv6Brackets(url.hostname) },
   } as RequestInit);
 }
 
@@ -468,27 +508,32 @@ async function nodePinnedFetch(
 ): Promise<Response> {
   const lib = url.protocol === 'https:' ? https : http;
   const headers = new Headers(init.headers);
-  if (!headers.has('host')) {
-    headers.set('host', url.host);
-  }
+  // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
+  headers.set('host', url.host);
+
+  const body = await serializeNodeBody(init.body ?? undefined, headers);
 
   const headerObject: Record<string, string> = {};
   headers.forEach((value, key) => {
     headerObject[key] = value;
   });
 
-  const body = init.body;
-  if (body !== undefined && body !== null && typeof body !== 'string' && !Buffer.isBuffer(body)) {
-    // Keep the Node path simple for tool usage (string/Buffer bodies).
-    throw new Error('Pinned Node fetch only supports string or Buffer bodies');
-  }
+  // Node TLS treats bracketed IPv6 literals as DNS names; strip for SNI/cert matching.
+  const tlsServerName = stripIpv6Brackets(url.hostname);
 
   return new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+
     const req = lib.request(
       {
         protocol: url.protocol,
-        hostname: url.hostname,
-        servername: url.hostname,
+        hostname: tlsServerName,
+        servername: tlsServerName,
         port: url.port || undefined,
         path: `${url.pathname}${url.search}`,
         method: init.method ?? 'GET',
@@ -521,44 +566,61 @@ async function nodePinnedFetch(
         // Web Response rejects bodies for null-body statuses; drain and pass null.
         if (NULL_BODY_STATUS.has(status)) {
           res.resume();
-          resolve(
-            new Response(null, {
-              status,
-              statusText: res.statusMessage ?? '',
-              headers: responseHeaders,
-            })
+          settle(() =>
+            resolve(
+              new Response(null, {
+                status,
+                statusText: res.statusMessage ?? '',
+                headers: responseHeaders,
+              })
+            )
           );
           return;
         }
 
         const decoded = decodeContentEncoding(res, responseHeaders);
-        resolve(
-          new Response(Readable.toWeb(decoded) as ReadableStream, {
-            status,
-            statusText: res.statusMessage ?? '',
-            headers: responseHeaders,
-          })
+        settle(() =>
+          resolve(
+            new Response(Readable.toWeb(decoded) as ReadableStream, {
+              status,
+              statusText: res.statusMessage ?? '',
+              headers: responseHeaders,
+            })
+          )
         );
       }
     );
 
     const signal = init.signal;
+    let onAbort: (() => void) | undefined;
     if (signal) {
       if (signal.aborted) {
         req.destroy(abortError(signal.reason));
-        reject(abortError(signal.reason));
+        settle(() => reject(abortError(signal.reason)));
         return;
       }
-      const onAbort = () => {
+      onAbort = () => {
         req.destroy(abortError(signal.reason));
-        reject(abortError(signal.reason));
+        settle(() => reject(abortError(signal.reason)));
       };
       signal.addEventListener('abort', onAbort, { once: true });
-      req.on('close', () => signal.removeEventListener('abort', onAbort));
+      req.on('close', () => {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+      });
     }
 
-    req.on('error', reject);
-    if (body !== undefined && body !== null) {
+    // 101 Switching Protocols emits `upgrade` instead of the response callback;
+    // reject so timeouts/callers are not left hanging.
+    req.on('upgrade', (_res, socket) => {
+      socket.destroy();
+      req.destroy();
+      settle(() =>
+        reject(new Error('Protocol upgrade (101 Switching Protocols) is not supported by safeFetch'))
+      );
+    });
+
+    req.on('error', (err) => settle(() => reject(err)));
+    if (body !== undefined) {
       req.write(body);
     }
     req.end();

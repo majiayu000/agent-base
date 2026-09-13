@@ -217,6 +217,45 @@ describe('safeFetch redirect semantics', () => {
     }
   });
 
+  it('overrides caller-supplied Host with the validated URL host', async () => {
+    const original = globalThis.fetch;
+    let seenHost: string | null = null;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenHost = new Headers(init?.headers).get('host');
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      await safeFetch('https://1.1.1.1/vhost', {
+        headers: { Host: 'admin.internal' },
+      });
+      expect(seenHost).toBe('1.1.1.1');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('accepts URLSearchParams bodies on the Bun pinned path', async () => {
+    const original = globalThis.fetch;
+    let seenBody: unknown;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenBody = init?.body;
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const body = new URLSearchParams({ a: '1', b: '2' });
+      const response = await safeFetch('https://1.1.1.1/form', {
+        method: 'POST',
+        body,
+      });
+      expect(response.status).toBe(200);
+      expect(seenBody).toBeInstanceOf(URLSearchParams);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it('brackets IPv6 addresses when pinning Bun requests', async () => {
     const original = globalThis.fetch;
     let pinnedHref = '';
