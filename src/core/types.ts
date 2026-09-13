@@ -84,6 +84,11 @@ export interface Tool<TInput = unknown, TOutput = unknown> {
   description: string;
   /** JSON Schema for input parameters */
   parameters: ToolSchema;
+  /**
+   * When true, ToolExecutor may cache results if useCache is enabled.
+   * Defaults to false/absent so mutating and non-idempotent tools are never cached.
+   */
+  cacheable?: boolean;
   /** Execute the tool with parsed arguments */
   execute: (args: TInput) => Promise<TOutput>;
 }

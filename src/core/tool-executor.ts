@@ -138,8 +138,11 @@ export class ToolExecutor {
       };
     }
 
+    // Only cache tools explicitly marked cacheable (mutating tools must re-run)
+    const shouldCache = useCache && tool.cacheable === true;
+
     // Check cache first
-    if (useCache) {
+    if (shouldCache) {
       const cachedResult = this.getCachedResult(toolName, argsStr);
       if (cachedResult !== null) {
         return {
@@ -172,8 +175,8 @@ export class ToolExecutor {
       // Convert result to string
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
 
-      // Cache the result
-      if (useCache) {
+      // Cache the result only for opt-in cacheable tools
+      if (shouldCache) {
         this.setCachedResult(toolName, argsStr, resultStr);
       }
 
@@ -236,6 +239,7 @@ export class ToolBuilder<TInput = unknown> {
   private _name = '';
   private _description = '';
   private _parameters: ToolSchema = { type: 'object', properties: {} };
+  private _cacheable?: boolean;
 
   /**
    * Set tool name
@@ -262,6 +266,14 @@ export class ToolBuilder<TInput = unknown> {
   }
 
   /**
+   * Mark the tool as safe to cache (opt-in; default is not cacheable)
+   */
+  cacheable(cacheable = true): this {
+    this._cacheable = cacheable;
+    return this;
+  }
+
+  /**
    * Build the tool with an execute function
    */
   execute<TOutput>(fn: (args: TInput) => Promise<TOutput>): Tool<TInput, TOutput> {
@@ -276,6 +288,7 @@ export class ToolBuilder<TInput = unknown> {
       name: this._name,
       description: this._description,
       parameters: this._parameters,
+      ...(this._cacheable !== undefined ? { cacheable: this._cacheable } : {}),
       execute: fn,
     };
   }
@@ -295,12 +308,15 @@ export function defineTool<TInput, TOutput>(config: {
   name: string;
   description: string;
   parameters: ToolSchema;
+  /** Opt-in: only cacheable tools are stored when useCache is true */
+  cacheable?: boolean;
   execute: (args: TInput) => Promise<TOutput>;
 }): Tool<TInput, TOutput> {
   return {
     name: config.name,
     description: config.description,
     parameters: config.parameters,
+    ...(config.cacheable !== undefined ? { cacheable: config.cacheable } : {}),
     execute: config.execute,
   };
 }

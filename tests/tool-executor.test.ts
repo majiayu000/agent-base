@@ -184,6 +184,145 @@ describe('ToolExecutor', () => {
     });
   });
 
+  describe('caching', () => {
+    it('should re-execute mutating tools within TTL when cacheable is absent', async () => {
+      let executions = 0;
+      const writeFileTool = defineTool<{ path: string }, { ok: boolean }>({
+        name: 'write_file',
+        description: 'Write a file (mutating)',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+          },
+          required: ['path'],
+        },
+        execute: async () => {
+          executions += 1;
+          return { ok: true };
+        },
+      });
+
+      executor.register(writeFileTool);
+      executor.setCacheTTL(60_000);
+
+      const toolCall: ToolCall = {
+        id: 'call_write',
+        type: 'function',
+        function: {
+          name: 'write_file',
+          arguments: JSON.stringify({ path: '/tmp/x' }),
+        },
+      };
+
+      const first = await executor.execute(toolCall, true);
+      const second = await executor.execute(toolCall, true);
+
+      expect(first.error).toBeUndefined();
+      expect(second.error).toBeUndefined();
+      expect(executions).toBe(2);
+    });
+
+    it('should cache opt-in cacheable tools when useCache is true', async () => {
+      let executions = 0;
+      const pureTool = defineTool<{ q: string }, { answer: string }>({
+        name: 'lookup',
+        description: 'Pure lookup',
+        cacheable: true,
+        parameters: {
+          type: 'object',
+          properties: {
+            q: { type: 'string' },
+          },
+          required: ['q'],
+        },
+        execute: async ({ q }) => {
+          executions += 1;
+          return { answer: q };
+        },
+      });
+
+      executor.register(pureTool);
+      executor.setCacheTTL(60_000);
+
+      const toolCall: ToolCall = {
+        id: 'call_lookup',
+        type: 'function',
+        function: {
+          name: 'lookup',
+          arguments: JSON.stringify({ q: 'hello' }),
+        },
+      };
+
+      const first = await executor.execute(toolCall, true);
+      const second = await executor.execute(toolCall, true);
+
+      expect(JSON.parse(first.result)).toEqual({ answer: 'hello' });
+      expect(JSON.parse(second.result)).toEqual({ answer: 'hello' });
+      expect(executions).toBe(1);
+    });
+
+    it('should not cache cacheable tools when useCache is false', async () => {
+      let executions = 0;
+      const pureTool = defineTool<Record<string, never>, number>({
+        name: 'counter',
+        description: 'Cacheable counter',
+        cacheable: true,
+        parameters: { type: 'object', properties: {} },
+        execute: async () => {
+          executions += 1;
+          return executions;
+        },
+      });
+
+      executor.register(pureTool);
+
+      const toolCall: ToolCall = {
+        id: 'call_counter',
+        type: 'function',
+        function: { name: 'counter', arguments: '{}' },
+      };
+
+      await executor.execute(toolCall, false);
+      await executor.execute(toolCall, false);
+
+      expect(executions).toBe(2);
+    });
+
+    it('should plumb cacheable through ToolBuilder', async () => {
+      let executions = 0;
+      const tool = createTool<{ n: number }>()
+        .name('double')
+        .description('Double a number')
+        .cacheable(true)
+        .parameters({
+          type: 'object',
+          properties: { n: { type: 'number' } },
+          required: ['n'],
+        })
+        .execute(async ({ n }) => {
+          executions += 1;
+          return n * 2;
+        });
+
+      expect(tool.cacheable).toBe(true);
+      executor.register(tool);
+
+      const toolCall: ToolCall = {
+        id: 'call_double',
+        type: 'function',
+        function: {
+          name: 'double',
+          arguments: JSON.stringify({ n: 3 }),
+        },
+      };
+
+      await executor.execute(toolCall, true);
+      await executor.execute(toolCall, true);
+      expect(executions).toBe(1);
+    });
+  });
+
   describe('tool builders', () => {
     it('should create tool with defineTool', () => {
       const tool = defineTool({
@@ -195,6 +334,7 @@ describe('ToolExecutor', () => {
 
       expect(tool.name).toBe('test');
       expect(tool.description).toBe('Test tool');
+      expect(tool.cacheable).toBeUndefined();
     });
 
     it('should create tool with fluent builder', () => {
@@ -211,6 +351,7 @@ describe('ToolExecutor', () => {
         .execute(async ({ value }) => value * 2);
 
       expect(tool.name).toBe('multiply');
+      expect(tool.cacheable).toBeUndefined();
     });
 
     it('should throw error for missing name', () => {
