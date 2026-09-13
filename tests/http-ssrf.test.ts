@@ -77,6 +77,21 @@ describe('assertSafeHttpUrl', () => {
     await expect(assertSafeHttpUrl('https://[fed0::1]/')).rejects.toThrow(/blocked/i);
   });
 
+  it('rejects IPv4-embedded IPv6 forms that smuggle loopback/private/metadata', async () => {
+    // Deprecated IPv4-compatible ::/96
+    await expect(assertSafeHttpUrl('https://[::127.0.0.1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[::7f00:1]/')).rejects.toThrow(/blocked/i);
+    // SIIT / IPv4-translated ::ffff:0:0/96
+    await expect(assertSafeHttpUrl('https://[::ffff:0:7f00:1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[::ffff:0:127.0.0.1]/')).rejects.toThrow(/blocked/i);
+    // NAT64 well-known prefix 64:ff9b::/96
+    await expect(assertSafeHttpUrl('https://[64:ff9b::127.0.0.1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[64:ff9b::7f00:1]/')).rejects.toThrow(/blocked/i);
+    // 6to4 2002::/16 embedding 169.254.169.254
+    await expect(assertSafeHttpUrl('https://[2002:a9fe:a9fe::]')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[2002:7f00:1::]')).rejects.toThrow(/blocked/i);
+  });
+
   it('rejects numeric hostname smuggling', async () => {
     // URL parsers may normalize 2130706433 → 127.0.0.1; either form must be blocked
     await expect(
@@ -87,6 +102,21 @@ describe('assertSafeHttpUrl', () => {
   it('allows https public hostname when DNS resolution is skipped', async () => {
     const url = await assertSafeHttpUrl('https://example.com/path', { resolveDns: false });
     expect(url.hostname).toBe('example.com');
+  });
+
+  it('canonicalizes trailing DNS root dots before hostname checks', async () => {
+    await expect(
+      assertSafeHttpUrl('https://localhost./secret', { resolveDns: false })
+    ).rejects.toThrow(/localhost/i);
+    await expect(
+      assertSafeHttpUrl('https://metadata.google.internal./', { resolveDns: false })
+    ).rejects.toThrow(/metadata/i);
+
+    const ok = await assertSafeHttpUrl('https://example.com./path', {
+      resolveDns: false,
+      allowedHosts: ['example.com'],
+    });
+    expect(ok.hostname.replace(/\.$/, '')).toBe('example.com');
   });
 
   it('enforces optional host allowlist', async () => {
@@ -151,7 +181,13 @@ describe('safeFetch redirect semantics', () => {
     try {
       const response = await safeFetch('https://1.1.1.1/submit', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Encoding': 'identity',
+          'Content-Language': 'en',
+          'Content-Location': 'https://1.1.1.1/original',
+          Authorization: 'Bearer secret',
+        },
         body: JSON.stringify({ a: 1 }),
       });
       expect(response.status).toBe(200);
@@ -161,6 +197,29 @@ describe('safeFetch redirect semantics', () => {
       expect(calls[1].body == null || calls[1].body === '').toBe(true);
       // Cross-origin redirect must drop Authorization
       expect(calls[1].headers.get('authorization')).toBeNull();
+      // Body-describing headers must all be removed when the body is dropped
+      expect(calls[1].headers.get('content-type')).toBeNull();
+      expect(calls[1].headers.get('content-encoding')).toBeNull();
+      expect(calls[1].headers.get('content-language')).toBeNull();
+      expect(calls[1].headers.get('content-location')).toBeNull();
+      expect(calls[1].headers.get('content-length')).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('rejects cross-origin redirects when mode is same-origin', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(null, {
+        status: 302,
+        headers: { Location: 'https://1.0.0.1/cross' },
+      })) as typeof fetch;
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/start', { mode: 'same-origin' })
+      ).rejects.toThrow(/same-origin/i);
     } finally {
       globalThis.fetch = original;
     }

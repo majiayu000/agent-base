@@ -105,7 +105,12 @@ export async function validateSafeHttpUrl(
     throw new Error('URLs with embedded credentials are not allowed');
   }
 
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  // Strip brackets and a single trailing DNS root dot so localhost. / metadata.google.internal.
+  // match the same blocklist/allowlist entries as their non-FQDN forms.
+  const hostname = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
 
   if (!hostname) {
     throw new Error('URL hostname is required');
@@ -117,7 +122,9 @@ export async function validateSafeHttpUrl(
 
   // Distinguish undefined (no allowlist) from [] (fail-closed: reject all hosts).
   if (allowedHosts !== undefined) {
-    const allowed = new Set(allowedHosts.map((h) => h.toLowerCase()));
+    const allowed = new Set(
+      allowedHosts.map((h) => h.toLowerCase().replace(/\.$/, ''))
+    );
     if (!allowed.has(hostname)) {
       throw new Error(`Hostname not in allowlist: ${hostname}`);
     }
@@ -253,26 +260,21 @@ function isBlockedIpv4(ip: string): boolean {
   return false;
 }
 
+function ipv4FromHextets(hi: string, lo: string): string {
+  const h = parseInt(hi, 16);
+  const l = parseInt(lo, 16);
+  return `${(h >> 8) & 0xff}.${h & 0xff}.${(l >> 8) & 0xff}.${l & 0xff}`;
+}
+
+function hextetsAreZero(hextets: string[]): boolean {
+  return hextets.every((h) => parseInt(h, 16) === 0);
+}
+
 function isBlockedIpv6(ip: string): boolean {
   const normalized = ip.toLowerCase();
 
-  // IPv4-mapped IPv6 (:ffff:x.x.x.x)
-  const mapped = normalized.match(/^:?:ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (mapped) {
-    return isBlockedIpv4(mapped[1]);
-  }
-  const mappedHex = normalized.match(/^:?:ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-  if (mappedHex) {
-    const hi = parseInt(mappedHex[1], 16);
-    const lo = parseInt(mappedHex[2], 16);
-    const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-    return isBlockedIpv4(v4);
-  }
-
-  // Expand to check prefixes — use a coarse string/prefix approach via URL/net
-  // ::1 loopback
+  // ::1 loopback / :: unspecified — keep explicit for clarity before expansion edge cases
   if (normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') return true;
-  // Unspecified
   if (normalized === '::' || normalized === '0:0:0:0:0:0:0:0') return true;
 
   const full = expandIpv6(normalized);
@@ -302,15 +304,72 @@ function isBlockedIpv6(ip: string): boolean {
   // 2001:2::/48 benchmarking
   if (first === 0x2001 && second === 0x0002 && parseInt(full[2], 16) === 0) return true;
 
+  // IPv4-mapped ::ffff:0:0/96 — 0000:0000:0000:0000:0000:ffff:xxxx:xxxx
+  if (hextetsAreZero(full.slice(0, 5)) && parseInt(full[5], 16) === 0xffff) {
+    return isBlockedIpv4(ipv4FromHextets(full[6], full[7]));
+  }
+
+  // IPv4-translated / SIIT ::ffff:0:0/96 — 0000:0000:0000:0000:ffff:0000:xxxx:xxxx
+  if (
+    hextetsAreZero(full.slice(0, 4)) &&
+    parseInt(full[4], 16) === 0xffff &&
+    parseInt(full[5], 16) === 0
+  ) {
+    return isBlockedIpv4(ipv4FromHextets(full[6], full[7]));
+  }
+
+  // Deprecated IPv4-compatible ::/96 — 0000:0000:0000:0000:0000:0000:xxxx:xxxx
+  if (hextetsAreZero(full.slice(0, 6))) {
+    return isBlockedIpv4(ipv4FromHextets(full[6], full[7]));
+  }
+
+  // NAT64 well-known prefix 64:ff9b::/96
+  if (
+    first === 0x0064 &&
+    second === 0xff9b &&
+    hextetsAreZero(full.slice(2, 6))
+  ) {
+    return isBlockedIpv4(ipv4FromHextets(full[6], full[7]));
+  }
+
+  // 6to4 2002::/16 embeds IPv4 in bits 16–47
+  if (first === 0x2002) {
+    return isBlockedIpv4(ipv4FromHextets(full[1], full[2]));
+  }
+
   return false;
 }
 
+/**
+ * Expand an IPv6 literal to 8 hextets. Trailing dotted-quad forms
+ * (e.g. ::127.0.0.1, 64:ff9b::169.254.169.254) are converted to two hextets first.
+ */
 function expandIpv6(ip: string): string[] | null {
-  const halves = ip.split('::');
+  let working = ip.toLowerCase();
+
+  const dotted = working.match(/^(.*:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (dotted) {
+    const parts = dotted[2].split('.').map((p) => Number(p));
+    if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+      return null;
+    }
+    const hi = ((parts[0] << 8) | parts[1]).toString(16);
+    const lo = ((parts[2] << 8) | parts[3]).toString(16);
+    working = `${dotted[1]}${hi}:${lo}`;
+  }
+
+  const halves = working.split('::');
   if (halves.length > 2) return null;
 
-  const head = halves[0] ? halves[0].split(':') : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const head = halves[0] ? halves[0].split(':').filter((h) => h.length > 0) : [];
+  const tail =
+    halves.length === 2 && halves[1] ? halves[1].split(':').filter((h) => h.length > 0) : [];
+
+  // Reject non-hex hextets (e.g. leftover dotted debris).
+  if (![...head, ...tail].every((h) => /^[0-9a-f]{1,4}$/i.test(h))) {
+    return null;
+  }
+
   if (halves.length === 1) {
     if (head.length !== 8) return null;
     return head.map((h) => h.padStart(4, '0'));
@@ -324,6 +383,7 @@ function expandIpv6(ip: string): string[] | null {
  * SafeFetch options. `integrity` is omitted from the public type because the Node
  * pinned transport does not implement Subresource Integrity; Bun still accepts it
  * via native fetch when callers cast, but SafeFetchOptions does not advertise it.
+ * `mode` is supported for `same-origin` / `cors` / `no-cors` request constraints.
  */
 export interface SafeFetchOptions extends Omit<RequestInit, 'integrity' | 'redirect'> {
   /** Max redirects to follow after re-validating each Location. Default: 5. */
@@ -345,8 +405,19 @@ export async function safeFetch(
   assertMethodBodyCompatible(initialMethod, fetchInit.body);
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
+  const requestMode = fetchInit.mode ?? 'cors';
+  const initialOrigin = new URL(url).origin;
 
   for (let i = 0; i <= maxRedirects; i++) {
+    if (requestMode === 'same-origin') {
+      const targetOrigin = new URL(current).origin;
+      if (targetOrigin !== initialOrigin) {
+        throw new TypeError(
+          `Failed to fetch: '${requestMode}' mode forbids cross-origin request to ${current}`
+        );
+      }
+    }
+
     const validated = await validateSafeHttpUrl(current, {
       ...urlSafety,
       signal: requestInit.signal ?? urlSafety?.signal,
@@ -405,8 +476,12 @@ function nextRedirectInit(
   if (convertToGet) {
     method = 'GET';
     body = undefined;
+    // Fetch removes all body-related headers when the body is dropped.
     headers.delete('content-length');
     headers.delete('content-type');
+    headers.delete('content-encoding');
+    headers.delete('content-language');
+    headers.delete('content-location');
   }
 
   if (crossOrigin) {
@@ -661,6 +736,15 @@ async function nodePinnedFetch(
 
   const body = await prepareNodeBody(init.body ?? undefined, headers);
 
+  // Never trust caller-supplied framing — a mismatched Content-Length/Transfer-Encoding
+  // can smuggle a second request past Host pinning on keep-alive proxies.
+  headers.delete('content-length');
+  headers.delete('transfer-encoding');
+  if (body?.kind === 'buffer') {
+    headers.set('content-length', String(Buffer.byteLength(body.value)));
+  }
+  // Streaming bodies: omit Content-Length so Node uses chunked transfer automatically.
+
   const headerObject: Record<string, string> = {};
   headers.forEach((value, key) => {
     headerObject[key] = value;
@@ -721,8 +805,12 @@ async function nodePinnedFetch(
           }
         }
 
-        // Web Response rejects bodies for null-body statuses; drain and pass null.
-        if (NULL_BODY_STATUS.has(status)) {
+        // Web Response rejects bodies for null-body statuses; HEAD responses also
+        // have a null body even when status is not in NULL_BODY_STATUS.
+        const methodUpper = normalizeMethod(
+          typeof init.method === 'string' ? init.method : undefined
+        );
+        if (NULL_BODY_STATUS.has(status) || methodUpper === 'HEAD') {
           res.resume();
           settle(() =>
             resolve(
