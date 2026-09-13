@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
 import type { Tool } from '../core/types.js';
@@ -23,11 +24,11 @@ export interface ShellResult {
 export interface ShellSecurityPolicy {
   /** When false (default), shell_run rejects all invocations. */
   allowShellRun?: boolean;
-  /** Allowed executables for shell_exec (exact name or basename). Empty = deny all. */
+  /** Allowed executables for shell_exec (exact name or absolute path). Empty = deny all. */
   allowedCommands?: string[];
   /** Resolved cwd must stay under one of these roots. Default: [process.cwd()]. */
   allowedCwdRoots?: string[];
-  /** Strip secret-like keys from child env. Default: true. */
+  /** Strip secret-like keys and dangerous execution hooks from child env. Default: true. */
   scrubEnv?: boolean;
 }
 
@@ -38,8 +39,42 @@ export interface ResolvedShellSecurityPolicy {
   scrubEnv: boolean;
 }
 
+/** Matches suffixed credentials and common unprefixed exact names (API_KEY, TOKEN, SECRET, PASSWORD). */
 const SECRET_ENV_KEY =
-  /(_API_KEY|_TOKEN|_SECRET)$|^PASSWORD$|PASSWORD$/i;
+  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET)$|PASSWORD$/i;
+
+/** Env keys that can load/execute attacker-controlled code in child processes. */
+const DANGEROUS_ENV_KEYS = new Set(
+  [
+    'LD_PRELOAD',
+    'LD_LIBRARY_PATH',
+    'LD_AUDIT',
+    'LD_LOCAL_PRELOAD',
+    'DYLD_INSERT_LIBRARIES',
+    'DYLD_LIBRARY_PATH',
+    'DYLD_FORCE_FLAT_NAMESPACE',
+    'DYLD_VERSIONED_FRAMEWORK_PATH',
+    'DYLD_VERSIONED_LIBRARY_PATH',
+    'NODE_OPTIONS',
+    'NODE_PATH',
+    'NODE_EXTRA_CA_CERTS',
+    'PYTHONPATH',
+    'PYTHONSTARTUP',
+    'PYTHONHOME',
+    'PERL5OPT',
+    'PERL5LIB',
+    'RUBYOPT',
+    'RUBYLIB',
+    'BASH_ENV',
+    'ENV',
+    'SHELLOPTS',
+    'PS4',
+    'SSLKEYLOGFILE',
+    'GIT_EXTERNAL_DIFF',
+    'GIT_EXEC_PATH',
+    'IFS',
+  ].map((k) => k.toUpperCase())
+);
 
 export function resolveShellSecurityPolicy(
   policy: ShellSecurityPolicy = {}
@@ -60,75 +95,219 @@ export function isSecretEnvKey(key: string): boolean {
   return SECRET_ENV_KEY.test(key);
 }
 
-/**
- * Build child env from process.env + overlay, scrubbing secret-like keys when enabled.
- */
-export function buildChildEnv(
-  overlay: Record<string, string> = {},
-  scrub = true
-): NodeJS.ProcessEnv {
-  const merged: NodeJS.ProcessEnv = { ...process.env, ...overlay };
-  if (!scrub) {
-    return merged;
-  }
-  const scrubbed: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(merged)) {
-    if (value === undefined) continue;
-    if (isSecretEnvKey(key)) continue;
-    scrubbed[key] = value;
-  }
-  return scrubbed;
+/** True if env key can inject code / alter loader behavior. */
+export function isDangerousEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  if (DANGEROUS_ENV_KEYS.has(upper)) return true;
+  if (upper.startsWith('LD_') || upper.startsWith('DYLD_')) return true;
+  return false;
+}
+
+function commandHasPathSeparator(command: string): boolean {
+  return command.includes('/') || command.includes('\\');
 }
 
 /**
- * Ensure command is on the allowlist (exact match or basename match).
- * Rejects empty commands and path traversal via `..`.
+ * Resolve a path for jail checks: realpath existing ancestors so symlink escapes are caught.
  */
-export function assertAllowedCommand(
+export function resolvePathForJail(input: string): string {
+  const absolute = path.resolve(input);
+  let current = absolute;
+  const missing: string[] = [];
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    missing.unshift(path.basename(current));
+    current = parent;
+  }
+  try {
+    const real = fs.realpathSync(current);
+    return missing.length > 0 ? path.join(real, ...missing) : real;
+  } catch {
+    return absolute;
+  }
+}
+
+/** True if `child` is `parent` or a descendant (handles filesystem root `/` correctly). */
+export function isPathInsideRoot(child: string, parent: string): boolean {
+  const rel = path.relative(parent, child);
+  return (
+    rel === '' ||
+    (!rel.startsWith('..') && !path.isAbsolute(rel))
+  );
+}
+
+function tryRealpath(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function isRunnableFile(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+  } catch {
+    return false;
+  }
+  if (process.platform === 'win32') {
+    return true;
+  }
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    // Some platforms mark common utilities without +x in restricted sandboxes; still accept regular files.
+    return true;
+  }
+}
+
+/**
+ * Resolve a bare command name using the parent process PATH (never the caller overlay).
+ */
+export function lookupExecutableOnTrustedPath(
+  name: string,
+  pathEnv: string = process.env.PATH ?? ''
+): string | null {
+  const dirs = pathEnv.split(path.delimiter);
+  const extensions =
+    process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat', '.com'] : [''];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      const candidate = path.join(dir, name + ext);
+      if (isRunnableFile(candidate)) {
+        return tryRealpath(candidate);
+      }
+    }
+  }
+  return null;
+}
+
+function allowlistMatchesResolved(
+  allowedCommands: string[],
   command: string,
-  allowedCommands: string[]
-): void {
+  resolvedPath: string
+): boolean {
+  const resolvedBase = path.basename(resolvedPath);
+  return allowedCommands.some((entry) => {
+    if (commandHasPathSeparator(entry)) {
+      return tryRealpath(entry) === resolvedPath || path.resolve(entry) === resolvedPath;
+    }
+    // Basename / exact-name allowlist entries never authorize path-qualified commands.
+    if (commandHasPathSeparator(command)) {
+      return false;
+    }
+    return entry === command || entry === resolvedBase || entry === path.basename(command);
+  });
+}
+
+/**
+ * Resolve the executable that will be spawned using a trusted PATH, canonicalize it,
+ * and require it to match the allowlist. Returns the absolute path to pass to spawn.
+ */
+export function resolveAllowedCommand(
+  command: string,
+  allowedCommands: string[],
+  trustedPathEnv: string = process.env.PATH ?? ''
+): string {
   if (!command || !command.trim()) {
     throw new Error('shell_exec denied: empty command');
   }
   if (command.includes('..')) {
-    throw new Error(`shell_exec denied: command path traversal not allowed: ${command}`);
+    throw new Error(
+      `shell_exec denied: command path traversal not allowed: ${command}`
+    );
   }
   if (allowedCommands.length === 0) {
     throw new Error(
       'shell_exec denied: no commands allowlisted (pass allowedCommands via createShellTools)'
     );
   }
-  const base = path.basename(command);
-  const ok = allowedCommands.some((entry) => entry === command || entry === base);
-  if (!ok) {
-    throw new Error(
-      `shell_exec denied: command not allowlisted: ${command}`
-    );
+
+  let resolvedPath: string | null;
+  if (commandHasPathSeparator(command)) {
+    const absolute = path.resolve(command);
+    if (!isRunnableFile(absolute) && !fs.existsSync(absolute)) {
+      throw new Error(`shell_exec denied: command not found: ${command}`);
+    }
+    resolvedPath = tryRealpath(absolute);
+  } else {
+    resolvedPath = lookupExecutableOnTrustedPath(command, trustedPathEnv);
+    if (!resolvedPath) {
+      throw new Error(`shell_exec denied: command not found on trusted PATH: ${command}`);
+    }
   }
+
+  if (!allowlistMatchesResolved(allowedCommands, command, resolvedPath)) {
+    throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
+  }
+
+  return resolvedPath;
 }
 
 /**
- * Resolve cwd and require it to stay under an allowed root.
+ * Ensure command is on the allowlist after trusted-PATH resolution.
+ */
+export function assertAllowedCommand(
+  command: string,
+  allowedCommands: string[]
+): void {
+  resolveAllowedCommand(command, allowedCommands);
+}
+
+/**
+ * Resolve cwd and require it to stay under an allowed root (realpath-aware).
  */
 export function assertAllowedCwd(
   cwd: string | undefined,
   allowedCwdRoots: string[]
 ): string {
-  const resolved = path.resolve(cwd ?? process.cwd());
+  const resolved = resolvePathForJail(cwd ?? process.cwd());
   const allowed = allowedCwdRoots.some((root) => {
-    const normalizedRoot = path.resolve(root);
-    return (
-      resolved === normalizedRoot ||
-      resolved.startsWith(normalizedRoot + path.sep)
-    );
+    const normalizedRoot = resolvePathForJail(root);
+    return isPathInsideRoot(resolved, normalizedRoot);
   });
   if (!allowed) {
-    throw new Error(
-      `shell denied: cwd outside allowed roots: ${resolved}`
-    );
+    throw new Error(`shell denied: cwd outside allowed roots: ${resolved}`);
   }
   return resolved;
+}
+
+/**
+ * Build child env from process.env + overlay, scrubbing secrets and dangerous hooks.
+ * Caller-supplied PATH is ignored; the parent process PATH is always used.
+ */
+export function buildChildEnv(
+  overlay: Record<string, string> = {},
+  scrub = true
+): NodeJS.ProcessEnv {
+  const trustedPath = process.env.PATH;
+  const merged: NodeJS.ProcessEnv = { ...process.env, ...overlay };
+  // Never let the tool caller redirect executable lookup via PATH.
+  if (trustedPath !== undefined) {
+    merged.PATH = trustedPath;
+  } else {
+    delete merged.PATH;
+  }
+
+  if (!scrub) {
+    return merged;
+  }
+
+  const scrubbed: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(merged)) {
+    if (value === undefined) continue;
+    if (isSecretEnvKey(key)) continue;
+    if (isDangerousEnvKey(key)) continue;
+    scrubbed[key] = value;
+  }
+  if (trustedPath !== undefined) {
+    scrubbed.PATH = trustedPath;
+  }
+  return scrubbed;
 }
 
 function runArgvProcess(
@@ -222,7 +401,7 @@ export function createShellExecTool(
       properties: {
         command: {
           type: 'string',
-          description: 'The command to execute (e.g., "ls", "npm", "git")',
+          description: 'The command to execute (e.g., "ls", "git")',
         },
         args: {
           type: 'array',
@@ -239,17 +418,18 @@ export function createShellExecTool(
         },
         env: {
           type: 'object',
-          description: 'Additional environment variables (secret-like keys are scrubbed)',
+          description:
+            'Additional environment variables (secrets and dangerous loader hooks are scrubbed; PATH overlay ignored)',
         },
       },
       required: ['command'],
     },
     execute: async ({ command, args = [], cwd, timeout = 60000, env = {} }) => {
-      assertAllowedCommand(command, resolved.allowedCommands);
+      const resolvedCommand = resolveAllowedCommand(command, resolved.allowedCommands);
       const safeCwd = assertAllowedCwd(cwd, resolved.allowedCwdRoots);
       const childEnv = buildChildEnv(env, resolved.scrubEnv);
 
-      return runArgvProcess(command, args, {
+      return runArgvProcess(resolvedCommand, args, {
         cwd: safeCwd,
         env: childEnv,
         timeout,

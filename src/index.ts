@@ -81,8 +81,12 @@ export {
   resolveShellSecurityPolicy,
   buildChildEnv,
   isSecretEnvKey,
+  isDangerousEnvKey,
+  resolveAllowedCommand,
   assertAllowedCommand,
   assertAllowedCwd,
+  resolvePathForJail,
+  isPathInsideRoot,
 } from './tools/shell.js';
 
 // Utilities - Logger

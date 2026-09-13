@@ -6,7 +6,10 @@ import { filesystemTools } from './tools/filesystem.js';
 import { createShellTools } from './tools/shell.js';
 import type { AgentResult } from './core/types.js';
 
-/** Local CLI opt-in policy — still deny shell_run; allow a small argv allowlist under cwd. */
+/**
+ * Local CLI opt-in policy — deny shell_run; small argv allowlist under cwd.
+ * Omit general-purpose interpreters (node/npm/bun) so shell_exec cannot run arbitrary code.
+ */
 const cliShellTools = createShellTools({
   allowShellRun: false,
   allowedCommands: [
@@ -17,9 +20,6 @@ const cliShellTools = createShellTools({
     'head',
     'wc',
     'git',
-    'npm',
-    'bun',
-    'node',
     'which',
   ],
   allowedCwdRoots: [process.cwd()],

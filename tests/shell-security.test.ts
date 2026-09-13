@@ -10,8 +10,12 @@ import {
   shellExecTool,
   buildChildEnv,
   isSecretEnvKey,
+  isDangerousEnvKey,
   assertAllowedCommand,
   assertAllowedCwd,
+  resolveAllowedCommand,
+  isPathInsideRoot,
+  resolvePathForJail,
 } from '../src/tools/shell.js';
 
 describe('Shell security (SEC-07)', () => {
@@ -83,6 +87,34 @@ describe('Shell security (SEC-07)', () => {
         assertAllowedCommand('../echo', ['echo'])
       ).toThrow(/path traversal/);
     });
+
+    it('rejects path-qualified basename bypasses', () => {
+      const decoyDir = path.join(tmpRoot, 'attacker');
+      fs.mkdirSync(decoyDir, { recursive: true });
+      const decoy = path.join(decoyDir, 'echo');
+      fs.writeFileSync(decoy, '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+      expect(() => resolveAllowedCommand(decoy, ['echo'])).toThrow(/not allowlisted/);
+    });
+
+    it('ignores caller PATH overlay when resolving and spawning', async () => {
+      const decoyDir = path.join(tmpRoot, 'path-hijack');
+      fs.mkdirSync(decoyDir, { recursive: true });
+      const decoy = path.join(decoyDir, 'echo');
+      fs.writeFileSync(decoy, '#!/bin/sh\necho HIJACKED\n', { mode: 0o755 });
+
+      const exec = createShellExecTool({
+        allowedCommands: ['echo'],
+        allowedCwdRoots: [tmpRoot],
+      });
+      const result = await exec.execute({
+        command: 'echo',
+        args: ['trusted'],
+        cwd: tmpRoot,
+        env: { PATH: decoyDir },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('trusted');
+    });
   });
 
   describe('cwd jail', () => {
@@ -103,7 +135,24 @@ describe('Shell security (SEC-07)', () => {
     it('assertAllowedCwd accepts paths under root', () => {
       const nested = path.join(tmpRoot, 'nested');
       fs.mkdirSync(nested, { recursive: true });
-      expect(assertAllowedCwd(nested, [tmpRoot])).toBe(path.resolve(nested));
+      expect(assertAllowedCwd(nested, [tmpRoot])).toBe(resolvePathForJail(nested));
+    });
+
+    it('rejects symlink cwd that escapes the jail', () => {
+      const link = path.join(tmpRoot, 'escape-link');
+      try {
+        fs.symlinkSync(outsideRoot, link);
+      } catch {
+        // Skip on platforms that cannot create symlinks in this environment.
+        return;
+      }
+      expect(() => assertAllowedCwd(link, [tmpRoot])).toThrow(/cwd outside allowed roots/);
+    });
+
+    it('treats filesystem root as containing descendants', () => {
+      expect(isPathInsideRoot('/tmp', '/')).toBe(true);
+      expect(isPathInsideRoot('/', '/')).toBe(true);
+      expect(assertAllowedCwd('/tmp', ['/'])).toBe(resolvePathForJail('/tmp'));
     });
   });
 
@@ -114,21 +163,47 @@ describe('Shell security (SEC-07)', () => {
       expect(isSecretEnvKey('DB_SECRET')).toBe(true);
       expect(isSecretEnvKey('PASSWORD')).toBe(true);
       expect(isSecretEnvKey('DB_PASSWORD')).toBe(true);
+      expect(isSecretEnvKey('API_KEY')).toBe(true);
+      expect(isSecretEnvKey('TOKEN')).toBe(true);
+      expect(isSecretEnvKey('SECRET')).toBe(true);
       expect(isSecretEnvKey('PATH')).toBe(false);
       expect(isSecretEnvKey('HOME')).toBe(false);
     });
 
-    it('strips secret keys from child env', () => {
+    it('detects dangerous execution-hook env keys', () => {
+      expect(isDangerousEnvKey('LD_PRELOAD')).toBe(true);
+      expect(isDangerousEnvKey('NODE_OPTIONS')).toBe(true);
+      expect(isDangerousEnvKey('DYLD_INSERT_LIBRARIES')).toBe(true);
+      expect(isDangerousEnvKey('PYTHONPATH')).toBe(true);
+      expect(isDangerousEnvKey('HOME')).toBe(false);
+    });
+
+    it('strips secret keys and dangerous hooks from child env', () => {
       const prev = process.env.TEST_HARNESS_API_KEY;
       process.env.TEST_HARNESS_API_KEY = 'super-secret';
       try {
         const env = buildChildEnv(
-          { SAFE_FLAG: '1', OTHER_TOKEN: 'leak' },
+          {
+            SAFE_FLAG: '1',
+            OTHER_TOKEN: 'leak',
+            API_KEY: 'unprefixed',
+            TOKEN: 'bare-token',
+            SECRET: 'bare-secret',
+            LD_PRELOAD: '/tmp/evil.so',
+            NODE_OPTIONS: '--require /tmp/evil.js',
+            PATH: '/tmp/attacker',
+          },
           true
         );
         expect(env.TEST_HARNESS_API_KEY).toBeUndefined();
         expect(env.OTHER_TOKEN).toBeUndefined();
+        expect(env.API_KEY).toBeUndefined();
+        expect(env.TOKEN).toBeUndefined();
+        expect(env.SECRET).toBeUndefined();
+        expect(env.LD_PRELOAD).toBeUndefined();
+        expect(env.NODE_OPTIONS).toBeUndefined();
         expect(env.SAFE_FLAG).toBe('1');
+        expect(env.PATH).toBe(process.env.PATH);
       } finally {
         if (prev === undefined) {
           delete process.env.TEST_HARNESS_API_KEY;
@@ -154,7 +229,7 @@ describe('Shell security (SEC-07)', () => {
             'process.stdout.write(process.env.SHELL_SEC_TEST_API_KEY ?? "ABSENT")',
           ],
           cwd: tmpRoot,
-          env: { SHELL_SEC_TEST_TOKEN: 'also-secret' },
+          env: { SHELL_SEC_TEST_TOKEN: 'also-secret', API_KEY: 'nope' },
         });
         expect(result.exitCode).toBe(0);
         expect(result.stdout).toBe('ABSENT');
