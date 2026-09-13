@@ -114,6 +114,16 @@ export {
   validatedCalculatorTool,
 } from './utils/validation.js';
 
+// Utilities - URL safety (SSRF protection)
+export {
+  assertSafeHttpUrl,
+  safeFetch,
+} from './utils/url-safety.js';
+export type {
+  UrlSafetyOptions,
+  SafeFetchOptions,
+} from './utils/url-safety.js';
+
 // Utilities - Token Tracker
 export {
   TokenTracker,

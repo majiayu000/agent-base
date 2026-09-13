@@ -1,4 +1,5 @@
 import { defineTool } from '../core/tool-executor.js';
+import { safeFetch } from '../utils/url-safety.js';
 
 // ============================================================================
 // HTTP Request Tools
@@ -21,13 +22,14 @@ export const httpGetTool = defineTool<
   HttpResponse
 >({
   name: 'http_get',
-  description: 'Make an HTTP GET request to fetch data from a URL. Returns status, headers, and response body.',
+  description:
+    'Make an HTTPS GET request to fetch data from a URL. Blocks private/link-local/metadata targets (SSRF protection). Returns status, headers, and response body.',
   parameters: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The URL to fetch (must be a valid HTTP/HTTPS URL)',
+        description: 'The URL to fetch (https only; private/link-local hosts are blocked)',
       },
       headers: {
         type: 'object',
@@ -45,7 +47,7 @@ export const httpGetTool = defineTool<
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     try {
-      const response = await fetch(url, {
+      const response = await safeFetch(url, {
         method: 'GET',
         headers: {
           'User-Agent': 'AgentBase/1.0',
@@ -65,7 +67,7 @@ export const httpGetTool = defineTool<
         statusText: response.statusText,
         headers: responseHeaders,
         body: body.slice(0, 50000), // Limit body size
-        url: response.url,
+        url: response.url || url,
         ok: response.ok,
       };
     } finally {
@@ -88,13 +90,14 @@ export const httpPostTool = defineTool<
   HttpResponse
 >({
   name: 'http_post',
-  description: 'Make an HTTP POST request to send data to a URL. Supports JSON, form data, and plain text.',
+  description:
+    'Make an HTTPS POST request to send data to a URL. Blocks private/link-local/metadata targets (SSRF protection). Supports JSON, form data, and plain text.',
   parameters: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The URL to send the request to',
+        description: 'The URL to send the request to (https only; private/link-local hosts are blocked)',
       },
       body: {
         type: 'string',
@@ -148,7 +151,7 @@ export const httpPostTool = defineTool<
     }
 
     try {
-      const response = await fetch(url, {
+      const response = await safeFetch(url, {
         method: 'POST',
         headers: requestHeaders,
         body: requestBody,
@@ -166,7 +169,7 @@ export const httpPostTool = defineTool<
         statusText: response.statusText,
         headers: responseHeaders,
         body: responseBody.slice(0, 50000),
-        url: response.url,
+        url: response.url || url,
         ok: response.ok,
       };
     } finally {
@@ -183,13 +186,14 @@ export const fetchJsonTool = defineTool<
   { data: unknown; status: number }
 >({
   name: 'fetch_json',
-  description: 'Fetch JSON data from a URL and parse it. Simpler than http_get for JSON APIs.',
+  description:
+    'Fetch JSON data from an HTTPS URL and parse it. Blocks private/link-local/metadata targets (SSRF protection). Simpler than http_get for JSON APIs.',
   parameters: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The URL to fetch JSON from',
+        description: 'The URL to fetch JSON from (https only; private/link-local hosts are blocked)',
       },
       headers: {
         type: 'object',
@@ -199,9 +203,9 @@ export const fetchJsonTool = defineTool<
     required: ['url'],
   },
   execute: async ({ url, headers = {} }) => {
-    const response = await fetch(url, {
+    const response = await safeFetch(url, {
       headers: {
-        'Accept': 'application/json',
+        Accept: 'application/json',
         'User-Agent': 'AgentBase/1.0',
         ...headers,
       },
