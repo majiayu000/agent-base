@@ -24,8 +24,10 @@ export interface AgentTask {
   description: string;
   /** Input for the task */
   input: unknown;
-  /** Assigned agent role */
+  /** Preferred agent role (filter for assignment; not overwritten by load balancing) */
   assignedRole?: string;
+  /** Worker id that was selected to run the task */
+  assignedWorkerId?: string;
   /** Task dependencies (other task IDs) */
   dependencies?: string[];
   /** Priority (higher = more important) */
@@ -165,11 +167,14 @@ export const roundRobinStrategy: CoordinationStrategy = {
       return firstWorker ?? null;
     }
 
-    // Round-robin selection based on completed task count
+    // Round-robin selection based on completed task count per worker
     const taskCounts = new Map<string, number>();
-    for (const [taskId, t] of context.tasks) {
-      if (t.status === 'completed' && t.assignedRole) {
-        taskCounts.set(t.assignedRole, (taskCounts.get(t.assignedRole) || 0) + 1);
+    for (const [, t] of context.tasks) {
+      if (t.status === 'completed' && t.assignedWorkerId) {
+        taskCounts.set(
+          t.assignedWorkerId,
+          (taskCounts.get(t.assignedWorkerId) || 0) + 1
+        );
       }
     }
 
@@ -439,7 +444,7 @@ export class MultiAgentCoordinator {
       return;
     }
 
-    task.assignedRole = workerId;
+    task.assignedWorkerId = workerId;
     task.status = 'in_progress';
     task.startedAt = new Date();
     this.runningTasks.add(task.id);

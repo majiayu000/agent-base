@@ -356,7 +356,7 @@ describe('Multi-Agent Pattern', () => {
         const worker1 = createWorker(
           createTestRole('w1', ['process']),
           async (task) => {
-            taskAssignments.push(`w1-${task.id}`);
+            taskAssignments.push('w1');
             return task.input;
           }
         );
@@ -364,7 +364,7 @@ describe('Multi-Agent Pattern', () => {
         const worker2 = createWorker(
           createTestRole('w2', ['process']),
           async (task) => {
-            taskAssignments.push(`w2-${task.id}`);
+            taskAssignments.push('w2');
             return task.input;
           }
         );
@@ -378,11 +378,62 @@ describe('Multi-Agent Pattern', () => {
           .addTasks([
             { id: 't1', description: 'Process task', input: 1 },
             { id: 't2', description: 'Process task', input: 2 },
+            { id: 't3', description: 'Process task', input: 3 },
+            { id: 't4', description: 'Process task', input: 4 },
           ]);
 
         await coordinator.execute();
 
-        expect(taskAssignments).toHaveLength(2);
+        expect(taskAssignments).toHaveLength(4);
+        const w1Count = taskAssignments.filter((id) => id === 'w1').length;
+        const w2Count = taskAssignments.filter((id) => id === 'w2').length;
+        expect(w1Count).toBe(2);
+        expect(w2Count).toBe(2);
+        expect(taskAssignments).toEqual(['w1', 'w2', 'w1', 'w2']);
+
+        const tasks = coordinator.getTasks();
+        for (const task of tasks) {
+          expect(task.assignedWorkerId).toBeDefined();
+          // Role preference must remain unset when not provided by the caller
+          expect(task.assignedRole).toBeUndefined();
+        }
+      });
+
+      it('should balance by assignedWorkerId while preserving assignedRole preference', async () => {
+        const taskAssignments: string[] = [];
+
+        // Two workers that share the same capable role filter via capability matching
+        // (no assignedRole preference) — already covered above. Here we assert that an
+        // explicit assignedRole preference is not overwritten when the worker runs.
+        const worker = createWorker(
+          createTestRole('specific', ['process']),
+          async (task) => {
+            taskAssignments.push(task.assignedWorkerId ?? 'unknown');
+            return task.assignedRole;
+          }
+        );
+
+        const coordinator = createCoordinator({
+          strategy: roundRobinStrategy,
+          maxConcurrentTasks: 1,
+        })
+          .registerWorker(worker)
+          .registerWorker(
+            createWorker(createTestRole('other', ['other']), async () => 'other')
+          )
+          .addTask({
+            id: 't1',
+            description: 'Process task',
+            input: null,
+            assignedRole: 'specific',
+          });
+
+        const result = await coordinator.execute();
+
+        expect(result.results.get('t1')).toBe('specific');
+        expect(coordinator.getTask('t1')?.assignedRole).toBe('specific');
+        expect(coordinator.getTask('t1')?.assignedWorkerId).toBe('specific');
+        expect(taskAssignments).toEqual(['specific']);
       });
     });
 
