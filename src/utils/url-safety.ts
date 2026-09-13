@@ -2,9 +2,10 @@ import { lookup } from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable, pipeline } from 'node:stream';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 import type { IncomingMessage } from 'node:http';
+import type { Transform } from 'node:stream';
 
 // ============================================================================
 // URL Safety (SSRF protection)
@@ -620,6 +621,10 @@ async function pipeWebStreamToRequest(
     req.end();
   } catch (err) {
     await reader.cancel(err).catch(() => undefined);
+    // Ensure the ClientRequest does not retain an open socket after upload failure.
+    if (!req.destroyed) {
+      req.destroy(err instanceof Error ? err : undefined);
+    }
     throw err;
   } finally {
     if (signal && onAbort) {
@@ -698,7 +703,7 @@ async function pinnedFetch(
   for (let i = 0; i < validated.addresses.length; i++) {
     const pinned = validated.addresses[i];
     try {
-      if (useBun) {
+      if (useBun && canUseBunPinnedFetch(validated.url)) {
         return await bunPinnedFetch(validated.url, pinned, init);
       }
       return await nodePinnedFetch(validated.url, pinned, init);
@@ -731,6 +736,19 @@ function setPinnedHostname(requestUrl: URL, pinned: { address: string; family: n
   }
 }
 
+/**
+ * Bun's fetch `tls.serverName` is unreliable on engines declared as `bun >=1.0`
+ * (e.g. 1.2.14 ignores it for cert verification). Prefer Node's `servername` for
+ * HTTPS DNS hostnames; Bun fetch remains fine for plain HTTP and IP-literal HTTPS
+ * (certificate identity already matches the pinned address).
+ */
+function canUseBunPinnedFetch(url: URL): boolean {
+  if (url.protocol !== 'https:') {
+    return true;
+  }
+  return isIP(stripIpv6Brackets(url.hostname)) !== 0;
+}
+
 async function bunPinnedFetch(
   url: URL,
   pinned: { address: string; family: number },
@@ -743,13 +761,17 @@ async function bunPinnedFetch(
   // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
   headers.set('host', url.host);
 
-  return fetch(requestUrl.href, {
+  const fetchInit: RequestInit & { tls?: { serverName: string } } = {
     ...init,
     headers,
     redirect: 'manual',
-    // Bun-specific: keep SNI/certificate validation on the original hostname.
-    tls: { serverName: stripIpv6Brackets(url.hostname) },
-  } as RequestInit);
+  };
+  if (url.protocol === 'https:') {
+    // Retain original hostname for SNI/cert checks when Bun honors it (IP-literal HTTPS).
+    fetchInit.tls = { serverName: stripIpv6Brackets(url.hostname) };
+  }
+
+  return fetch(requestUrl.href, fetchInit);
 }
 
 async function nodePinnedFetch(
@@ -908,9 +930,13 @@ async function nodePinnedFetch(
     req.on('error', (err) => settle(() => reject(err)));
 
     if (body?.kind === 'stream') {
-      void pipeWebStreamToRequest(body.stream, req, signal).catch((err) =>
-        settle(() => reject(err instanceof Error ? err : new Error(String(err))))
-      );
+      void pipeWebStreamToRequest(body.stream, req, signal).catch((err) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (!req.destroyed) {
+          req.destroy(error);
+        }
+        settle(() => reject(error));
+      });
       return;
     }
 
@@ -956,19 +982,28 @@ function decodeContentEncoding(res: IncomingMessage, headers: Headers): Readable
   }
 
   // Decode in reverse application order (Fetch-compatible).
-  let stream: Readable = res;
+  // Use pipeline() so upstream socket / intermediate decoder errors propagate to
+  // the final stream consumed via Readable.toWeb (plain pipe() does not).
+  const transforms: Transform[] = [];
   for (let i = codings.length - 1; i >= 0; i--) {
     const coding = codings[i];
     if (coding === 'gzip' || coding === 'x-gzip') {
-      stream = stream.pipe(createGunzip());
+      transforms.push(createGunzip());
     } else if (coding === 'deflate') {
-      stream = stream.pipe(createInflate());
+      transforms.push(createInflate());
     } else {
-      stream = stream.pipe(createBrotliDecompress());
+      transforms.push(createBrotliDecompress());
     }
   }
 
+  const output = new PassThrough();
+  pipeline([res, ...transforms, output], (err) => {
+    if (err && !output.destroyed) {
+      output.destroy(err);
+    }
+  });
+
   headers.delete('content-encoding');
   headers.delete('content-length');
-  return stream;
+  return output;
 }
