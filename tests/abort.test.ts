@@ -164,6 +164,11 @@ describe('abort helpers', () => {
           });
     expect(isAbortError(timeout)).toBe(false);
   });
+
+  it('isAbortError does not treat abort-shaped messages without AbortError name', () => {
+    expect(isAbortError(new Error('transaction aborted due to conflict'))).toBe(false);
+    expect(isAbortError(new Error('request was aborted by the peer'))).toBe(false);
+  });
 });
 
 describe('parseStream abort', () => {
@@ -494,7 +499,24 @@ describe('filesystem abort', () => {
     const link = join(base, 'link');
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, 'keep.txt'), 'keep');
-    symlinkSync(target, link);
+
+    // Windows without SeCreateSymbolicLinkPrivilege cannot create dir symlinks;
+    // junctions work without elevation. Skip only when neither is available.
+    try {
+      if (process.platform === 'win32') {
+        symlinkSync(target, link, 'junction');
+      } else {
+        symlinkSync(target, link);
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EACCES') {
+        rmSync(base, { recursive: true, force: true });
+        return;
+      }
+      rmSync(base, { recursive: true, force: true });
+      throw err;
+    }
 
     try {
       const result = await deleteTool.execute({ path: link, recursive: true });
@@ -800,6 +822,103 @@ describe('Agent abort path regressions', () => {
       const toolMessages = messages.filter((m) => m.role === 'tool');
       expect(toolMessages).toHaveLength(1);
       expect(toolMessages[0]?.tool_call_id).toBe('call_exec');
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('skips onToolResult when afterToolCall middleware aborts', async () => {
+    let onToolResultCount = 0;
+    let afterToolCallCount = 0;
+
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      events: {
+        onToolResult: () => {
+          onToolResultCount += 1;
+        },
+      },
+      middlewares: [
+        {
+          afterToolCall: async (_ctx, result) => {
+            afterToolCallCount += 1;
+            agent.abort();
+            return result;
+          },
+        },
+      ],
+    });
+
+    agent.registerTool(
+      defineTool({
+        name: 'echo',
+        description: 'echo',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => 'ok',
+      })
+    );
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_after',
+                  function: { name: 'echo', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(afterToolCallCount).toBe(1);
+      expect(onToolResultCount).toBe(0);
+      expect(result.toolCalls).toHaveLength(1);
+
+      const messages = agent.getMessages();
+      const toolMessages = messages.filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(1);
+      expect(toolMessages[0]?.tool_call_id).toBe('call_after');
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('does not treat abort-shaped LLM errors as cancellation when the run signal is live', async () => {
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+    });
+
+    const createStream = vi
+      .spyOn(LLMClient.prototype, 'createStream')
+      .mockRejectedValue(new Error('transaction aborted due to conflict'));
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).not.toBe('Agent run was aborted.');
+      expect(result.maxIterationsReached).toBe(true);
     } finally {
       createStream.mockRestore();
     }

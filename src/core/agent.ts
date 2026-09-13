@@ -361,6 +361,17 @@ export class Agent {
           // Run afterToolCall middleware
           const afterResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
 
+          // Abort during/after afterToolCall: skip onToolResult side effects while
+          // still pairing the (possibly middleware-modified) tool result.
+          if (signal.aborted) {
+            return {
+              toolCall: modifiedToolCall,
+              toolName,
+              toolArgs,
+              execResult: afterResult,
+            };
+          }
+
           // Notify tool result
           this.events.onToolResult?.(
             toolName,

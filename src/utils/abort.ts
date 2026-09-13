@@ -17,10 +17,12 @@ export function createAbortError(message = 'This operation was aborted'): Error 
 /**
  * True when an error represents user/agent cancellation (DOMException or named Error).
  *
- * TimeoutError is intentionally excluded: native operation timeouts (e.g. from
- * AbortSignal.timeout() used for request deadlines) are not evidence that the
- * agent's own AbortSignal fired. Call sites that need to treat agent abort as
- * terminal should also check `signal.aborted`.
+ * Only trust `name === 'AbortError'`. Message heuristics (e.g. matching "aborted")
+ * are intentionally omitted: ordinary failures such as
+ * `Error("transaction aborted due to conflict")` must not skip retries or be
+ * reported as `Agent run was aborted.` TimeoutError is also excluded — native
+ * operation timeouts (e.g. AbortSignal.timeout()) are not agent cancellation.
+ * Call sites that need terminal cancel semantics should also check `signal.aborted`.
  */
 export function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== 'object') {
@@ -31,18 +33,7 @@ export function isAbortError(error: unknown): boolean {
   if (name === 'TimeoutError') {
     return false;
   }
-  if (name === 'AbortError') {
-    return true;
-  }
-  // Some runtimes reject with plain Errors whose message mentions abort
-  if (
-    error instanceof Error &&
-    /aborted|AbortError/i.test(error.message) &&
-    !/timeout/i.test(error.message)
-  ) {
-    return true;
-  }
-  return false;
+  return name === 'AbortError';
 }
 
 /**
