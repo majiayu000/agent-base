@@ -273,6 +273,7 @@ export type {
   // Evaluation & Monitoring
   MetricValue,
   EvaluationCriteria,
+  MonitorEvaluationResult,
   MonitorConfig,
   MonitorStats,
   // Reasoning

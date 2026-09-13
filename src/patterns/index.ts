@@ -157,6 +157,7 @@ export {
 export type {
   MetricValue,
   EvaluationCriteria,
+  EvaluationResult as MonitorEvaluationResult,
   MonitorConfig,
   MonitorStats,
 } from './evaluation.js';
