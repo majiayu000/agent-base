@@ -344,15 +344,31 @@ export class Agent {
           this.events.onToolCall?.(toolName, toolArgs);
 
           // Execute tool
-          let execResult = await this.toolExecutor.execute(modifiedToolCall, { signal });
+          const execResult = await this.toolExecutor.execute(modifiedToolCall, { signal });
+
+          // Abort during/after execute: ToolExecutor returns a normal result for
+          // AbortError, so recheck before afterToolCall / onToolResult side effects
+          // while still pairing the (synthetic or completed) tool result.
+          if (signal.aborted) {
+            return {
+              toolCall: modifiedToolCall,
+              toolName,
+              toolArgs,
+              execResult,
+            };
+          }
 
           // Run afterToolCall middleware
-          execResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
+          const afterResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
 
           // Notify tool result
-          this.events.onToolResult?.(toolName, execResult.result, execResult.error ? new Error(execResult.error) : undefined);
+          this.events.onToolResult?.(
+            toolName,
+            afterResult.result,
+            afterResult.error ? new Error(afterResult.error) : undefined
+          );
 
-          return { toolCall: modifiedToolCall, toolName, toolArgs, execResult };
+          return { toolCall: modifiedToolCall, toolName, toolArgs, execResult: afterResult };
         });
 
         const toolResults = await Promise.all(toolPromises);

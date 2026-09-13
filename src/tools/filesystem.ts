@@ -293,15 +293,29 @@ export const deleteTool = defineTool<
     /**
      * Walk the tree and delete entry-by-entry so abort can interrupt between
      * children. A single `fs.rm({ recursive })` cannot observe cancellation.
+     * Symlinks are unlinked without following so recursive delete never walks
+     * into (or empties) a symlink target directory.
      */
     async function deleteRecursive(currentPath: string): Promise<void> {
       throwIfAborted(signal);
+      const rootStats = await fs.lstat(currentPath);
+      if (rootStats.isSymbolicLink()) {
+        await fs.unlink(currentPath);
+        return;
+      }
+      if (!rootStats.isDirectory()) {
+        await fs.unlink(currentPath);
+        return;
+      }
+
       const items = await fs.readdir(currentPath, { withFileTypes: true });
 
       for (const item of items) {
         throwIfAborted(signal);
         const childPath = path.join(currentPath, item.name);
-        if (item.isDirectory()) {
+        if (item.isSymbolicLink()) {
+          await fs.unlink(childPath);
+        } else if (item.isDirectory()) {
           await deleteRecursive(childPath);
         } else {
           await fs.unlink(childPath);
@@ -313,11 +327,14 @@ export const deleteTool = defineTool<
     }
 
     try {
-      const stats = await fs.stat(absolutePath);
+      // lstat: do not follow a root symlink into its target directory.
+      const stats = await fs.lstat(absolutePath);
 
       throwIfAborted(signal);
 
-      if (stats.isDirectory()) {
+      if (stats.isSymbolicLink()) {
+        await fs.unlink(absolutePath);
+      } else if (stats.isDirectory()) {
         if (recursive) {
           await deleteRecursive(absolutePath);
         } else {

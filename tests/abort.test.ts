@@ -15,7 +15,16 @@ import { shellExecTool, shellRunTool } from '../src/tools/shell.js';
 import { deleteTool, listDirectoryTool, writeFileTool } from '../src/tools/filesystem.js';
 import type { Stream } from 'openai/streaming';
 import type OpenAI from 'openai';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, rmSync } from 'fs';
+import { createServer, type AddressInfo } from 'http';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+  rmSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -403,18 +412,33 @@ describe('shell_run abort', () => {
 
 describe('http_get abort', () => {
   it('cancels fetch when signal aborts', async () => {
-    const controller = new AbortController();
+    // Local server that accepts the connection but never responds — avoids
+    // environment-flaky unreachable IPs / blocked ports rejecting before abort.
+    const server = createServer((_req, _res) => {
+      // intentionally hang
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const { port } = server.address() as AddressInfo;
 
+    const controller = new AbortController();
     const pending = httpGetTool.execute(
       {
-        url: 'http://10.255.255.1:9/',
+        url: `http://127.0.0.1:${port}/`,
         timeout: 30_000,
       },
       controller.signal
     );
 
     setTimeout(() => controller.abort(), 30);
-    await expectAbort(pending);
+    try {
+      await expectAbort(pending);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
   }, 10_000);
 });
 
@@ -461,6 +485,24 @@ describe('filesystem abort', () => {
       expect(existsSync(join(root, 'a.txt'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('unlinks a directory symlink without deleting the target contents', async () => {
+    const base = join(tmpdir(), `agent-base-rm-symlink-${Date.now()}-${process.pid}`);
+    const target = join(base, 'target');
+    const link = join(base, 'link');
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'keep.txt'), 'keep');
+    symlinkSync(target, link);
+
+    try {
+      const result = await deleteTool.execute({ path: link, recursive: true });
+      expect(result.deleted).toBe(true);
+      expect(existsSync(link)).toBe(false);
+      expect(existsSync(join(target, 'keep.txt'))).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
     }
   });
 });
@@ -673,6 +715,91 @@ describe('Agent abort path regressions', () => {
       const toolMessages = messages.filter((m) => m.role === 'tool');
       expect(toolMessages).toHaveLength(1);
       expect(toolMessages[0]?.tool_call_id).toBe('call_pre');
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('skips afterToolCall/onToolResult when aborted during ToolExecutor.execute', async () => {
+    let onToolResultCount = 0;
+    let afterToolCallCount = 0;
+    let toolStarted = false;
+
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      events: {
+        onToolResult: () => {
+          onToolResultCount += 1;
+        },
+      },
+      middlewares: [
+        {
+          afterToolCall: async (_ctx, result) => {
+            afterToolCallCount += 1;
+            return result;
+          },
+        },
+      ],
+    });
+
+    agent.registerTool(
+      defineTool({
+        name: 'slow',
+        description: 'slow',
+        parameters: { type: 'object', properties: {} },
+        execute: async (_args, signal) => {
+          toolStarted = true;
+          agent.abort();
+          // Simulate ToolExecutor seeing an abort mid-flight.
+          throwIfAborted(signal);
+          return 'should-not-complete';
+        },
+      })
+    );
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_exec',
+                  function: { name: 'slow', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(toolStarted).toBe(true);
+      expect(onToolResultCount).toBe(0);
+      expect(afterToolCallCount).toBe(0);
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.error).toMatch(/aborted/i);
+
+      const messages = agent.getMessages();
+      const toolMessages = messages.filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(1);
+      expect(toolMessages[0]?.tool_call_id).toBe('call_exec');
     } finally {
       createStream.mockRestore();
     }
