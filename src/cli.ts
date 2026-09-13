@@ -3,25 +3,17 @@ import { createAgent } from './core/agent.js';
 import { builtinTools } from './tools/builtin.js';
 import { httpTools } from './tools/http.js';
 import { filesystemTools } from './tools/filesystem.js';
-import { createShellTools } from './tools/shell.js';
+import { createShellTools, getCliSafeAllowedCommands } from './tools/shell.js';
 import type { AgentResult } from './core/types.js';
 
 /**
  * Local CLI opt-in policy — deny shell_run; small argv allowlist under cwd.
- * Omit general-purpose interpreters (node/npm/bun) and VCS tools (git) so
- * shell_exec cannot run arbitrary code via aliases or script runners.
+ * Uses a platform-specific safe allowlist so Windows gets real executables
+ * (not Unix cmd builtins that fail under spawn).
  */
 const cliShellTools = createShellTools({
   allowShellRun: false,
-  allowedCommands: [
-    'ls',
-    'pwd',
-    'echo',
-    'cat',
-    'head',
-    'wc',
-    'which',
-  ],
+  allowedCommands: getCliSafeAllowedCommands(),
   allowedCwdRoots: [process.cwd()],
   scrubEnv: true,
 });

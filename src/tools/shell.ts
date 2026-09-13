@@ -97,6 +97,21 @@ export function resolveShellSecurityPolicy(
   };
 }
 
+/**
+ * Platform-specific safe argv allowlist for the interactive CLI.
+ * Unix names such as `echo`/`ls` are cmd builtins on Windows and do not resolve
+ * as spawnable executables; use real System32 tools there instead.
+ * Omit general-purpose interpreters (node/npm/bun) and VCS tools (git).
+ */
+export function getCliSafeAllowedCommands(
+  platform: NodeJS.Platform = process.platform
+): string[] {
+  if (platform === 'win32') {
+    return ['where', 'hostname', 'whoami', 'findstr', 'sort'];
+  }
+  return ['ls', 'pwd', 'echo', 'cat', 'head', 'wc', 'which'];
+}
+
 /** True if env key looks like a credential / secret. */
 export function isSecretEnvKey(key: string): boolean {
   return SECRET_ENV_KEY.test(key);
@@ -226,11 +241,15 @@ function allowlistMatchesResolved(
 /**
  * Resolve the executable that will be spawned using a trusted PATH, canonicalize it,
  * and require it to match the allowlist. Returns the absolute path to pass to spawn.
+ *
+ * Path-qualified commands (containing `/` or `\`) are resolved against `cwd`
+ * (the validated shell working directory), not the Node process cwd.
  */
 export function resolveAllowedCommand(
   command: string,
   allowedCommands: string[],
-  trustedPathEnv: string = process.env.PATH ?? ''
+  trustedPathEnv: string = process.env.PATH ?? '',
+  cwd: string = process.cwd()
 ): string {
   if (!command || !command.trim()) {
     throw new Error('shell_exec denied: empty command');
@@ -248,7 +267,7 @@ export function resolveAllowedCommand(
 
   let resolvedPath: string | null;
   if (commandHasPathSeparator(command)) {
-    const absolute = path.resolve(command);
+    const absolute = path.resolve(cwd, command);
     if (!isRunnableFile(absolute) && !fs.existsSync(absolute)) {
       throw new Error(`shell_exec denied: command not found: ${command}`);
     }
@@ -272,9 +291,10 @@ export function resolveAllowedCommand(
  */
 export function assertAllowedCommand(
   command: string,
-  allowedCommands: string[]
+  allowedCommands: string[],
+  cwd: string = process.cwd()
 ): void {
-  resolveAllowedCommand(command, allowedCommands);
+  resolveAllowedCommand(command, allowedCommands, process.env.PATH ?? '', cwd);
 }
 
 /**
@@ -447,8 +467,14 @@ export function createShellExecTool(
       required: ['command'],
     },
     execute: async ({ command, args = [], cwd, timeout = 60000, env = {} }) => {
-      const resolvedCommand = resolveAllowedCommand(command, resolved.allowedCommands);
+      // Validate cwd first so path-qualified commands resolve against the jail, not process.cwd().
       const safeCwd = assertAllowedCwd(cwd, resolved.allowedCwdRoots);
+      const resolvedCommand = resolveAllowedCommand(
+        command,
+        resolved.allowedCommands,
+        process.env.PATH ?? '',
+        safeCwd
+      );
       const childEnv = buildChildEnv(env, resolved.scrubEnv);
 
       return runArgvProcess(resolvedCommand, args, {

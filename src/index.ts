@@ -87,6 +87,7 @@ export {
   assertAllowedCwd,
   resolvePathForJail,
   isPathInsideRoot,
+  getCliSafeAllowedCommands,
 } from './tools/shell.js';
 
 // Utilities - Logger

@@ -16,6 +16,7 @@ import {
   resolveAllowedCommand,
   isPathInsideRoot,
   resolvePathForJail,
+  getCliSafeAllowedCommands,
 } from '../src/tools/shell.js';
 
 describe('Shell security (SEC-07)', () => {
@@ -96,6 +97,41 @@ describe('Shell security (SEC-07)', () => {
       expect(() => resolveAllowedCommand(decoy, ['echo'])).toThrow(/not allowlisted/);
     });
 
+    it('resolves relative path-qualified commands against the requested cwd', () => {
+      const binDir = path.join(tmpRoot, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const toolPath = path.join(binDir, 'tool');
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho from-cwd\n', { mode: 0o755 });
+      const realTool = fs.realpathSync(toolPath);
+
+      const resolved = resolveAllowedCommand(
+        path.join('.', 'bin', 'tool'),
+        [realTool],
+        process.env.PATH ?? '',
+        tmpRoot
+      );
+      expect(resolved).toBe(realTool);
+    });
+
+    it('runs relative allowlisted executable with explicit cwd', async () => {
+      const binDir = path.join(tmpRoot, 'rel-bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const toolPath = path.join(binDir, 'tool');
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho from-cwd\n', { mode: 0o755 });
+      const realTool = fs.realpathSync(toolPath);
+
+      const exec = createShellExecTool({
+        allowedCommands: [realTool],
+        allowedCwdRoots: [tmpRoot],
+      });
+      const result = await exec.execute({
+        command: path.join('.', 'rel-bin', 'tool'),
+        cwd: tmpRoot,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('from-cwd');
+    });
+
     it('ignores caller PATH overlay when resolving and spawning', async () => {
       const decoyDir = path.join(tmpRoot, 'path-hijack');
       fs.mkdirSync(decoyDir, { recursive: true });
@@ -114,6 +150,28 @@ describe('Shell security (SEC-07)', () => {
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe('trusted');
+    });
+  });
+
+  describe('cli safe allowlist', () => {
+    it('uses Windows-native executables on win32', () => {
+      const cmds = getCliSafeAllowedCommands('win32');
+      expect(cmds).toEqual(['where', 'hostname', 'whoami', 'findstr', 'sort']);
+      expect(cmds).not.toContain('echo');
+      expect(cmds).not.toContain('ls');
+    });
+
+    it('keeps Unix-friendly names on non-Windows platforms', () => {
+      expect(getCliSafeAllowedCommands('darwin')).toEqual([
+        'ls',
+        'pwd',
+        'echo',
+        'cat',
+        'head',
+        'wc',
+        'which',
+      ]);
+      expect(getCliSafeAllowedCommands('linux')).toContain('echo');
     });
   });
 
