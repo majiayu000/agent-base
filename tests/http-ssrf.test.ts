@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test';
-import { assertSafeHttpUrl } from '../src/utils/url-safety.js';
+import { assertSafeHttpUrl, safeFetch } from '../src/utils/url-safety.js';
 import { httpGetTool, httpPostTool, fetchJsonTool } from '../src/tools/http.js';
 
 /**
@@ -42,6 +42,25 @@ describe('assertSafeHttpUrl', () => {
     await expect(assertSafeHttpUrl('https://172.16.5.1/')).rejects.toThrow(/blocked/i);
   });
 
+  it('rejects full 198.18.0.0/15 benchmarking range', async () => {
+    await expect(assertSafeHttpUrl('https://198.18.0.1/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://198.19.255.255/')).rejects.toThrow(/blocked/i);
+  });
+
+  it('rejects documentation /24 prefixes but not adjacent public /16 addresses', async () => {
+    await expect(assertSafeHttpUrl('https://192.0.2.1/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://198.51.100.1/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://203.0.113.1/')).rejects.toThrow(/blocked/i);
+
+    // Adjacent addresses outside the reserved /24 must not be blanket-blocked by /16 checks.
+    await expect(
+      assertSafeHttpUrl('https://198.51.101.1/', { resolveDns: false })
+    ).resolves.toBeInstanceOf(URL);
+    await expect(
+      assertSafeHttpUrl('https://203.0.114.1/', { resolveDns: false })
+    ).resolves.toBeInstanceOf(URL);
+  });
+
   it('rejects IPv6 loopback and link-local', async () => {
     await expect(assertSafeHttpUrl('https://[::1]/')).rejects.toThrow(/blocked/i);
     await expect(assertSafeHttpUrl('https://[fe80::1]/')).rejects.toThrow(/blocked/i);
@@ -72,6 +91,125 @@ describe('assertSafeHttpUrl', () => {
       allowedHosts: ['api.example.com'],
     });
     expect(ok.hostname).toBe('api.example.com');
+  });
+
+  it('treats an empty allowlist as fail-closed', async () => {
+    await expect(
+      assertSafeHttpUrl('https://example.com/', {
+        resolveDns: false,
+        allowedHosts: [],
+      })
+    ).rejects.toThrow(/allowlist/i);
+  });
+});
+
+describe('safeFetch redirect semantics', () => {
+  it('returns 304 to the caller instead of treating it as a redirect', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(null, { status: 304, statusText: 'Not Modified' })) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://1.1.1.1/resource', { method: 'GET' });
+      expect(response.status).toBe(304);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('converts POST 302 redirects to GET without body', async () => {
+    const calls: Array<{ url: string; method?: string; body?: unknown; headers: Headers }> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({
+        url: href,
+        method: init?.method,
+        body: init?.body,
+        headers: new Headers(init?.headers),
+      });
+      if (calls.length === 1) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'https://1.0.0.1/next' },
+        });
+      }
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://1.1.1.1/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret' },
+        body: JSON.stringify({ a: 1 }),
+      });
+      expect(response.status).toBe(200);
+      expect(calls).toHaveLength(2);
+      expect((calls[0].method ?? 'GET').toUpperCase()).toBe('POST');
+      expect((calls[1].method ?? 'GET').toUpperCase()).toBe('GET');
+      expect(calls[1].body == null || calls[1].body === '').toBe(true);
+      // Cross-origin redirect must drop Authorization
+      expect(calls[1].headers.get('authorization')).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('strips credentials on cross-origin redirects and keeps them on same-origin', async () => {
+    const authHeaders: Array<string | null> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      authHeaders.push(new Headers(init?.headers).get('authorization'));
+      if (authHeaders.length === 1) {
+        return new Response(null, {
+          status: 307,
+          headers: { Location: 'https://1.1.1.1/same-origin' },
+        });
+      }
+      if (authHeaders.length === 2) {
+        return new Response(null, {
+          status: 307,
+          headers: { Location: 'https://1.0.0.1/cross-origin' },
+        });
+      }
+      return new Response(`done:${href}`, { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      await safeFetch('https://1.1.1.1/start', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer keep-me' },
+      });
+      expect(authHeaders[0]).toBe('Bearer keep-me');
+      expect(authHeaders[1]).toBe('Bearer keep-me');
+      expect(authHeaders[2]).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('pins Bun fetch to a validated literal address with Host/SNI retained', async () => {
+    const original = globalThis.fetch;
+    let sawPinned = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const headers = new Headers(init?.headers);
+      // Literal IP validation pins to itself; Host should still be set for hostname URLs.
+      if (href.startsWith('https://1.1.1.1/')) {
+        sawPinned = true;
+        expect(headers.get('host')).toBe('1.1.1.1');
+      }
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://1.1.1.1/pin-check');
+      expect(response.status).toBe(200);
+      expect(sawPinned).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });
 

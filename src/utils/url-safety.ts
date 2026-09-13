@@ -1,5 +1,8 @@
 import { lookup } from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import { isIP } from 'node:net';
+import { Readable } from 'node:stream';
 
 // ============================================================================
 // URL Safety (SSRF protection)
@@ -8,10 +11,12 @@ import { isIP } from 'node:net';
 export interface UrlSafetyOptions {
   /** Allow http: in addition to https:. Default: false (https only). */
   allowHttp?: boolean;
-  /** If set, hostname must be in this list (case-insensitive). */
+  /** If set, hostname must be in this list (case-insensitive). Empty array rejects all hosts. */
   allowedHosts?: string[];
   /** Resolve DNS and reject private/link-local answers. Default: true. */
   resolveDns?: boolean;
+  /** Optional abort signal used to cancel DNS validation. */
+  signal?: AbortSignal;
 }
 
 const BLOCKED_HOSTNAMES = new Set([
@@ -19,6 +24,20 @@ const BLOCKED_HOSTNAMES = new Set([
   'metadata.google.internal',
   'metadata.google',
 ]);
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'cookie2',
+]);
+
+export interface ValidatedSafeUrl {
+  url: URL;
+  /** Addresses that passed safety checks; used to pin the connection. */
+  addresses: { address: string; family: number }[];
+}
 
 /**
  * Throw if `urlString` is not safe for outbound HTTP from agent tools.
@@ -28,7 +47,22 @@ export async function assertSafeHttpUrl(
   urlString: string,
   options: UrlSafetyOptions = {}
 ): Promise<URL> {
-  const { allowHttp = false, allowedHosts, resolveDns = true } = options;
+  const validated = await validateSafeHttpUrl(urlString, options);
+  return validated.url;
+}
+
+/**
+ * Validate a URL and return the parsed URL plus public addresses suitable for connection pinning.
+ */
+export async function validateSafeHttpUrl(
+  urlString: string,
+  options: UrlSafetyOptions = {}
+): Promise<ValidatedSafeUrl> {
+  const { allowHttp = false, allowedHosts, resolveDns = true, signal } = options;
+
+  if (signal?.aborted) {
+    throw abortError(signal.reason);
+  }
 
   let parsed: URL;
   try {
@@ -62,7 +96,8 @@ export async function assertSafeHttpUrl(
     throw new Error(`Blocked hostname: ${hostname}`);
   }
 
-  if (allowedHosts && allowedHosts.length > 0) {
+  // Distinguish undefined (no allowlist) from [] (fail-closed: reject all hosts).
+  if (allowedHosts !== undefined) {
     const allowed = new Set(allowedHosts.map((h) => h.toLowerCase()));
     if (!allowed.has(hostname)) {
       throw new Error(`Hostname not in allowlist: ${hostname}`);
@@ -72,7 +107,7 @@ export async function assertSafeHttpUrl(
   const ipVersion = isIP(hostname);
   if (ipVersion) {
     assertPublicIp(hostname, ipVersion);
-    return parsed;
+    return { url: parsed, addresses: [{ address: hostname, family: ipVersion }] };
   }
 
   // Block obvious decimal / hex IP encodings that isIP misses when dotted-odd
@@ -80,26 +115,55 @@ export async function assertSafeHttpUrl(
     throw new Error(`Blocked numeric hostname: ${hostname}`);
   }
 
-  if (resolveDns) {
-    let addresses: { address: string; family: number }[];
-    try {
-      addresses = await lookup(hostname, { all: true, verbatim: true });
-    } catch (err) {
-      throw new Error(
-        `Failed to resolve hostname "${hostname}": ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-
-    if (!addresses.length) {
-      throw new Error(`No DNS records for hostname: ${hostname}`);
-    }
-
-    for (const { address, family } of addresses) {
-      assertPublicIp(address, family);
-    }
+  if (!resolveDns) {
+    return { url: parsed, addresses: [] };
   }
 
-  return parsed;
+  const addresses = await lookupAll(hostname, signal);
+  if (!addresses.length) {
+    throw new Error(`No DNS records for hostname: ${hostname}`);
+  }
+
+  for (const { address, family } of addresses) {
+    assertPublicIp(address, family);
+  }
+
+  return { url: parsed, addresses };
+}
+
+async function lookupAll(
+  hostname: string,
+  signal?: AbortSignal
+): Promise<{ address: string; family: number }[]> {
+  if (signal?.aborted) {
+    throw abortError(signal.reason);
+  }
+
+  const lookupPromise = lookup(hostname, { all: true, verbatim: true }).catch((err) => {
+    throw new Error(
+      `Failed to resolve hostname "${hostname}": ${err instanceof Error ? err.message : String(err)}`
+    );
+  });
+
+  if (!signal) {
+    return lookupPromise;
+  }
+
+  return Promise.race([
+    lookupPromise,
+    new Promise<never>((_, reject) => {
+      const onAbort = () => reject(abortError(signal.reason));
+      signal.addEventListener('abort', onAbort, { once: true });
+      lookupPromise.finally(() => signal.removeEventListener('abort', onAbort));
+    }),
+  ]);
+}
+
+function abortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const err = new Error(reason ? String(reason) : 'This operation was aborted');
+  err.name = 'AbortError';
+  return err;
 }
 
 function looksLikeNumericHost(hostname: string): boolean {
@@ -133,7 +197,7 @@ function isBlockedIpv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     return true;
   }
-  const [a, b] = parts;
+  const [a, b, c] = parts;
 
   // 0.0.0.0/8
   if (a === 0) return true;
@@ -149,10 +213,16 @@ function isBlockedIpv4(ip: string): boolean {
   if (a === 192 && b === 168) return true;
   // 100.64.0.0/10 carrier-grade NAT
   if (a === 100 && b >= 64 && b <= 127) return true;
-  // 192.0.0.0/24, 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 documentation
-  if (a === 192 && b === 0) return true;
-  if (a === 198 && (b === 51 || b === 18)) return true;
-  if (a === 203 && b === 0) return true;
+  // 192.0.0.0/24 IETF protocol assignments / special-purpose
+  if (a === 192 && b === 0 && c === 0) return true;
+  // 192.0.2.0/24 TEST-NET-1 documentation
+  if (a === 192 && b === 0 && c === 2) return true;
+  // 198.18.0.0/15 benchmarking
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  // 198.51.100.0/24 TEST-NET-2 documentation
+  if (a === 198 && b === 51 && c === 100) return true;
+  // 203.0.113.0/24 TEST-NET-3 documentation
+  if (a === 203 && b === 0 && c === 113) return true;
   // 224.0.0.0/4 multicast and 240.0.0.0/4 reserved
   if (a >= 224) return true;
 
@@ -217,7 +287,8 @@ export interface SafeFetchOptions extends RequestInit {
 }
 
 /**
- * fetch wrapper that validates the initial URL and every redirect Location.
+ * fetch wrapper that validates the initial URL and every redirect Location,
+ * pins the TCP connection to a validated address, and applies Fetch redirect semantics.
  */
 export async function safeFetch(
   url: string,
@@ -225,26 +296,217 @@ export async function safeFetch(
 ): Promise<Response> {
   const { maxRedirects = 5, urlSafety, ...fetchInit } = init;
   let current = url;
+  let requestInit: RequestInit = { ...fetchInit };
 
   for (let i = 0; i <= maxRedirects; i++) {
-    await assertSafeHttpUrl(current, urlSafety);
-
-    const response = await fetch(current, {
-      ...fetchInit,
-      redirect: 'manual',
+    const validated = await validateSafeHttpUrl(current, {
+      ...urlSafety,
+      signal: requestInit.signal ?? urlSafety?.signal,
     });
 
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      if (!location) {
-        throw new Error(`Redirect (${response.status}) without Location header`);
-      }
-      current = new URL(location, current).href;
-      continue;
+    const response = await pinnedFetch(validated, requestInit);
+
+    if (!REDIRECT_STATUS.has(response.status)) {
+      return response;
     }
 
-    return response;
+    const location = response.headers.get('location');
+    // Cancel unused redirect body so sockets are not held open.
+    await cancelResponseBody(response);
+
+    if (!location) {
+      throw new Error(`Redirect (${response.status}) without Location header`);
+    }
+
+    const nextUrl = new URL(location, current);
+    const crossOrigin = !sameOrigin(current, nextUrl.href);
+    requestInit = nextRedirectInit(requestInit, response.status, crossOrigin);
+    current = nextUrl.href;
   }
 
   throw new Error(`Too many redirects (limit ${maxRedirects})`);
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  const left = new URL(a);
+  const right = new URL(b);
+  return (
+    left.protocol === right.protocol &&
+    left.hostname.toLowerCase() === right.hostname.toLowerCase() &&
+    left.port === right.port
+  );
+}
+
+function nextRedirectInit(
+  init: RequestInit,
+  status: number,
+  crossOrigin: boolean
+): RequestInit {
+  const headers = new Headers(init.headers);
+  let method = (init.method ?? 'GET').toUpperCase();
+  let body = init.body;
+
+  // Fetch semantics: 301/302/303 convert non-GET/HEAD to GET and drop body.
+  if (status === 301 || status === 302 || status === 303) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      method = 'GET';
+      body = undefined;
+      headers.delete('content-length');
+      headers.delete('content-type');
+    }
+  }
+
+  if (crossOrigin) {
+    for (const name of SENSITIVE_HEADERS) {
+      headers.delete(name);
+    }
+  }
+
+  return {
+    ...init,
+    method,
+    body,
+    headers,
+  };
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  if (!response.body) return;
+  await response.body.cancel().catch(() => undefined);
+}
+
+function preferAddress(
+  addresses: { address: string; family: number }[]
+): { address: string; family: number } | undefined {
+  return addresses.find((a) => a.family === 4) ?? addresses[0];
+}
+
+async function pinnedFetch(
+  validated: ValidatedSafeUrl,
+  init: RequestInit
+): Promise<Response> {
+  const pinned = preferAddress(validated.addresses);
+  if (!pinned) {
+    // DNS resolution disabled — fall back to normal fetch (no pin available).
+    return fetch(validated.url.href, { ...init, redirect: 'manual' });
+  }
+
+  // Bun: connect by validated IP while preserving Host + TLS server name.
+  if (typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined') {
+    return bunPinnedFetch(validated.url, pinned, init);
+  }
+
+  return nodePinnedFetch(validated.url, pinned, init);
+}
+
+async function bunPinnedFetch(
+  url: URL,
+  pinned: { address: string; family: number },
+  init: RequestInit
+): Promise<Response> {
+  const requestUrl = new URL(url.href);
+  requestUrl.hostname = pinned.address;
+
+  const headers = new Headers(init.headers);
+  if (!headers.has('host')) {
+    headers.set('host', url.host);
+  }
+
+  return fetch(requestUrl.href, {
+    ...init,
+    headers,
+    redirect: 'manual',
+    // Bun-specific: keep SNI/certificate validation on the original hostname.
+    tls: { serverName: url.hostname },
+  } as RequestInit);
+}
+
+async function nodePinnedFetch(
+  url: URL,
+  pinned: { address: string; family: number },
+  init: RequestInit
+): Promise<Response> {
+  const lib = url.protocol === 'https:' ? https : http;
+  const headers = new Headers(init.headers);
+  if (!headers.has('host')) {
+    headers.set('host', url.host);
+  }
+
+  const headerObject: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    headerObject[key] = value;
+  });
+
+  const body = init.body;
+  if (body !== undefined && body !== null && typeof body !== 'string' && !Buffer.isBuffer(body)) {
+    // Keep the Node path simple for tool usage (string/Buffer bodies).
+    throw new Error('Pinned Node fetch only supports string or Buffer bodies');
+  }
+
+  return new Promise<Response>((resolve, reject) => {
+    const req = lib.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        servername: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: init.method ?? 'GET',
+        headers: headerObject,
+        lookup: (_hostname, options, callback) => {
+          const cb = callback as (
+            err: Error | null,
+            address: string | { address: string; family: number }[],
+            family?: number
+          ) => void;
+          if (options?.all) {
+            cb(null, [{ address: pinned.address, family: pinned.family }]);
+          } else {
+            cb(null, pinned.address, pinned.family);
+          }
+        },
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        const responseHeaders = new Headers();
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (value === undefined) continue;
+          if (Array.isArray(value)) {
+            for (const item of value) responseHeaders.append(key, item);
+          } else {
+            responseHeaders.set(key, value);
+          }
+        }
+
+        resolve(
+          new Response(Readable.toWeb(res) as ReadableStream, {
+            status,
+            statusText: res.statusMessage ?? '',
+            headers: responseHeaders,
+          })
+        );
+      }
+    );
+
+    const signal = init.signal;
+    if (signal) {
+      if (signal.aborted) {
+        req.destroy(abortError(signal.reason));
+        reject(abortError(signal.reason));
+        return;
+      }
+      const onAbort = () => {
+        req.destroy(abortError(signal.reason));
+        reject(abortError(signal.reason));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      req.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
+
+    req.on('error', reject);
+    if (body !== undefined && body !== null) {
+      req.write(body);
+    }
+    req.end();
+  });
 }

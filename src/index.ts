@@ -117,11 +117,13 @@ export {
 // Utilities - URL safety (SSRF protection)
 export {
   assertSafeHttpUrl,
+  validateSafeHttpUrl,
   safeFetch,
 } from './utils/url-safety.js';
 export type {
   UrlSafetyOptions,
   SafeFetchOptions,
+  ValidatedSafeUrl,
 } from './utils/url-safety.js';
 
 // Utilities - Token Tracker
