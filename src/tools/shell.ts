@@ -515,20 +515,43 @@ export function assertAllowedCwd(
 }
 
 /**
+ * Read PATH from an env object using case-insensitive key matching.
+ * Windows env is case-insensitive; Node may surface `Path` rather than `PATH`.
+ */
+function readTrustedPath(env: NodeJS.ProcessEnv): string | undefined {
+  for (const [key, value] of Object.entries(env)) {
+    if (/^PATH$/i.test(key) && typeof value === 'string') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/** Remove every case-variant PATH key so Windows cannot honor attacker overlays. */
+function stripPathKeys(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (/^PATH$/i.test(key)) {
+      delete env[key];
+    }
+  }
+}
+
+/**
  * Build child env from process.env + overlay, scrubbing secrets and dangerous hooks.
- * Caller-supplied PATH is ignored; the parent process PATH is always used.
+ * Caller-supplied PATH (any casing) is ignored; the parent process PATH is always used.
  */
 export function buildChildEnv(
   overlay: Record<string, string> = {},
   scrub = true
 ): NodeJS.ProcessEnv {
-  const trustedPath = process.env.PATH;
+  // Capture trusted PATH before overlay merge (case-insensitive for win32).
+  const trustedPath = readTrustedPath(process.env);
   const merged: NodeJS.ProcessEnv = { ...process.env, ...overlay };
-  // Never let the tool caller redirect executable lookup via PATH.
+  // Strip Path/path/PATH from parent + overlay, then pin the trusted value only.
+  // Otherwise Windows child lookup can honor a retained case-variant attacker key.
+  stripPathKeys(merged);
   if (trustedPath !== undefined) {
     merged.PATH = trustedPath;
-  } else {
-    delete merged.PATH;
   }
 
   if (!scrub) {
@@ -538,6 +561,7 @@ export function buildChildEnv(
   const scrubbed: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(merged)) {
     if (value === undefined) continue;
+    if (/^PATH$/i.test(key)) continue;
     if (isSecretEnvKey(key)) continue;
     if (isDangerousEnvKey(key)) continue;
     scrubbed[key] = value;

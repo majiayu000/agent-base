@@ -748,6 +748,30 @@ describe('Shell security (SEC-07)', () => {
       }
     });
 
+    it('strips case-variant PATH overlay keys (win32-safe)', () => {
+      // Windows env is case-insensitive; retaining Path/path lets child lookup
+      // honor attacker directories even after merged.PATH is overwritten.
+      for (const scrub of [true, false]) {
+        const env = buildChildEnv(
+          {
+            Path: '/tmp/attacker-Path',
+            path: '/tmp/attacker-path',
+            PATH: '/tmp/attacker-PATH',
+            SAFE_FLAG: '1',
+          },
+          scrub
+        );
+        // Only the canonical PATH key may remain (Object.keys is case-exact).
+        const pathKeys = Object.keys(env).filter((k) => /^PATH$/i.test(k));
+        expect(pathKeys).toEqual(['PATH']);
+        expect(env.PATH).toBe(process.env.PATH);
+        expect(env.PATH).not.toBe('/tmp/attacker-Path');
+        expect(env.PATH).not.toBe('/tmp/attacker-path');
+        expect(env.PATH).not.toBe('/tmp/attacker-PATH');
+        expect(env.SAFE_FLAG).toBe('1');
+      }
+    });
+
     it('does not pass scrubbed secrets into a successful child process', async () => {
       const exec = createShellExecTool({
         allowedCommands: ['node'],
