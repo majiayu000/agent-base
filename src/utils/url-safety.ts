@@ -120,16 +120,26 @@ function isSameOrigin(a: URL, b: URL): boolean {
   );
 }
 
+/** Fetch strips credentials and fragments before serializing Referer. */
+function sanitizeReferrerUrl(referrerUrl: URL): URL {
+  const clean = new URL(referrerUrl.href);
+  clean.username = '';
+  clean.password = '';
+  clean.hash = '';
+  return clean;
+}
+
 /** Serialize a referrer URL per Referrer-Policy (returns null for no-referrer). */
 function serializeReferrer(
   referrerUrl: URL,
   requestUrl: URL,
   policy: string
 ): string | null {
-  const full = referrerUrl.href;
-  const origin = originString(referrerUrl);
-  const sameOrigin = isSameOrigin(referrerUrl, requestUrl);
-  const downgrade = isDowngrade(referrerUrl, requestUrl);
+  const sanitized = sanitizeReferrerUrl(referrerUrl);
+  const full = sanitized.href;
+  const origin = originString(sanitized);
+  const sameOrigin = isSameOrigin(sanitized, requestUrl);
+  const downgrade = isDowngrade(sanitized, requestUrl);
 
   switch (policy) {
     case 'no-referrer':
@@ -436,6 +446,12 @@ function isBlockedIpv6(ip: string): boolean {
     return isBlockedIpv4(ipv4FromHextets(full[6], full[7]));
   }
 
+  // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) — reject entirely.
+  // Translators may embed arbitrary IPv4 (including private) under this /48.
+  if (first === 0x0064 && second === 0xff9b && parseInt(full[2], 16) === 0x0001) {
+    return true;
+  }
+
   // 6to4 2002::/16 embeds IPv4 in bits 16–47
   if (first === 0x2002) {
     return isBlockedIpv4(ipv4FromHextets(full[1], full[2]));
@@ -509,6 +525,7 @@ export async function safeFetch(
   assertMethodBodyCompatible(initialMethod, fetchInit.body);
   const requestMode = fetchInit.mode ?? 'cors';
   assertNoCorsMethodAllowed(requestMode, initialMethod);
+  assertOnlyIfCachedMode(fetchInit.cache, requestMode);
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
   const initialOrigin = new URL(url).origin;
@@ -663,13 +680,27 @@ async function prepareNodeBody(
     return { kind: 'stream', stream: body as ReadableStream<Uint8Array> };
   }
 
+  // Stream Blob/File uploads instead of buffering the entire payload.
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    if (body.type && !headers.has('content-type')) {
+      headers.set('content-type', body.type);
+    }
+    return { kind: 'stream', stream: body.stream() as ReadableStream<Uint8Array> };
+  }
+
+  // FormData / URLSearchParams: encode via Request, then stream the body when available.
   const tmp = new Request('http://local.invalid', {
     method: 'POST',
     body,
-  });
+    // Node requires duplex for streaming request bodies produced from FormData.
+    duplex: 'half',
+  } as RequestInit);
   const contentType = tmp.headers.get('content-type');
   if (contentType && !headers.has('content-type')) {
     headers.set('content-type', contentType);
+  }
+  if (tmp.body) {
+    return { kind: 'stream', stream: tmp.body as ReadableStream<Uint8Array> };
   }
   return { kind: 'buffer', value: Buffer.from(await tmp.arrayBuffer()) };
 }
@@ -771,6 +802,18 @@ function assertNoCorsMethodAllowed(
 ): void {
   if (mode === 'no-cors' && !NO_CORS_METHODS.has(method)) {
     throw new TypeError(`'${method}' is not allowed in 'no-cors' mode.`);
+  }
+}
+
+/** Fetch rejects only-if-cached unless mode is same-origin. */
+function assertOnlyIfCachedMode(
+  cache: RequestInit['cache'] | undefined,
+  mode: RequestInit['mode'] | undefined
+): void {
+  if (cache === 'only-if-cached' && mode !== 'same-origin') {
+    throw new TypeError(
+      `'only-if-cached' cache mode can only be used with 'same-origin' request mode.`
+    );
   }
 }
 

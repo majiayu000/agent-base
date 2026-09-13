@@ -87,6 +87,9 @@ describe('assertSafeHttpUrl', () => {
     // NAT64 well-known prefix 64:ff9b::/96
     await expect(assertSafeHttpUrl('https://[64:ff9b::127.0.0.1]/')).rejects.toThrow(/blocked/i);
     await expect(assertSafeHttpUrl('https://[64:ff9b::7f00:1]/')).rejects.toThrow(/blocked/i);
+    // NAT64 local-use prefix 64:ff9b:1::/48 (embeds private IPv4 under translator)
+    await expect(assertSafeHttpUrl('https://[64:ff9b:1::a00:1]/')).rejects.toThrow(/blocked/i);
+    await expect(assertSafeHttpUrl('https://[64:ff9b:1:0:0:0:a00:1]/')).rejects.toThrow(/blocked/i);
     // 6to4 2002::/16 embedding 169.254.169.254
     await expect(assertSafeHttpUrl('https://[2002:a9fe:a9fe::]')).rejects.toThrow(/blocked/i);
     await expect(assertSafeHttpUrl('https://[2002:7f00:1::]')).rejects.toThrow(/blocked/i);
@@ -447,6 +450,34 @@ describe('safeFetch redirect semantics', () => {
         referrerPolicy: 'no-referrer',
       });
       expect(seenReferer).toBeNull();
+
+      seenReferer = null;
+      await safeFetch('https://1.1.1.1/resource', {
+        referrer: 'https://user:pass@example.com/page?q=1#secret',
+        referrerPolicy: 'unsafe-url',
+      });
+      expect(seenReferer).toBe('https://example.com/page?q=1');
+      expect(seenReferer).not.toMatch(/user|pass|secret|#/);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('rejects only-if-cached without same-origin mode', async () => {
+    const original = globalThis.fetch;
+    const fetchMock = mock(() => {
+      throw new Error('fetch should not be called for only-if-cached without same-origin');
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/', { cache: 'only-if-cached' })
+      ).rejects.toThrow(/only-if-cached/i);
+      await expect(
+        safeFetch('https://1.1.1.1/', { cache: 'only-if-cached', mode: 'cors' })
+      ).rejects.toThrow(/only-if-cached/i);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = original;
     }
