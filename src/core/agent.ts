@@ -5,6 +5,7 @@ import type { AgentConfig, AgentEvents, AgentResult, LLMClientConfig, Message, T
 import { defaultConfig } from './types.js';
 import type { AgentMiddleware, MiddlewareContext } from '../utils/middleware.js';
 import { MiddlewareRunner } from '../utils/middleware.js';
+import { abortableDelay, isAbortError } from '../utils/abort.js';
 
 // ============================================================================
 // Agent Options
@@ -119,26 +120,34 @@ export class Agent {
   }
 
   /**
-   * Retry wrapper with exponential backoff
+   * Retry wrapper with exponential backoff.
+   * Fail-fast on abort and use an abortable delay so we never sleep after cancel.
    */
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     let lastError: Error | null = null;
+    const signal = this.abortController?.signal;
 
     for (let attempt = 0; attempt < this.config.maxRetries; attempt++) {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error('Agent run was aborted.');
+      }
+
       try {
         return await fn();
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
         // Don't retry on abort
-        if (this.abortController?.signal.aborted) {
+        if (signal?.aborted || isAbortError(lastError)) {
           throw lastError;
         }
 
-        // Exponential backoff
+        // Exponential backoff (cancelled immediately if aborted mid-wait)
         if (attempt < this.config.maxRetries - 1) {
           const delay = this.config.retryDelayMs * Math.pow(2, attempt);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          await abortableDelay(delay, signal);
         }
       }
     }
@@ -159,6 +168,7 @@ export class Agent {
       metadata: {},
       logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
     };
+    const signal = this.abortController!.signal;
 
     // Add user message to context
     this.context.add({
@@ -178,7 +188,7 @@ export class Agent {
     // ReAct Loop: Think → Act → Observe → Repeat
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       // Check abort signal
-      if (this.abortController?.signal.aborted) {
+      if (signal.aborted) {
         result.response = 'Agent run was aborted.';
         return result;
       }
@@ -190,7 +200,7 @@ export class Agent {
         // Run beforeRequest middleware
         const messages = await this.middleware.runBeforeRequest(mwCtx, this.context.getMessages());
 
-        // Create streaming request with retry
+        // Create streaming request with retry (signal cancels in-flight LLM HTTP)
         const stream = await this.withRetry(async () => {
           return this.llmClient.createStream({
             model: this.config.model,
@@ -198,17 +208,18 @@ export class Agent {
             tools: this.toolExecutor.count > 0 ? this.toolExecutor.getSchemas() : undefined,
             thinkingBudget: this.config.thinkingBudget,
             maxTokens: this.config.maxTokens,
+            signal,
           });
         });
 
-        // Parse stream with callbacks
+        // Parse stream with callbacks (abort stops iteration and cancels stream)
         const parsed = await parseStream(stream, {
           onToken: this.events.onToken,
           onThinking: (thinking) => {
             result.thinking += thinking;
             this.events.onThinking?.(thinking);
           },
-          onToolCallStart: (name) => {
+          onToolCallStart: (_name) => {
             // Early notification that a tool is being called
           },
           onUsage: (usage) => {
@@ -217,6 +228,7 @@ export class Agent {
             result.usage!.completionTokens += usage.completionTokens;
             result.usage!.totalTokens += usage.totalTokens;
           },
+          signal,
         });
 
         // Build assistant message
@@ -246,7 +258,7 @@ export class Agent {
           return result;
         }
 
-        // Execute tool calls in parallel
+        // Execute tool calls in parallel (signal cancels shell/HTTP in-flight work)
         const toolPromises = parsed.toolCalls.map(async (toolCall) => {
           // Run beforeToolCall middleware
           const modifiedToolCall = await this.middleware.runBeforeToolCall(mwCtx, toolCall);
@@ -264,7 +276,7 @@ export class Agent {
           this.events.onToolCall?.(toolName, toolArgs);
 
           // Execute tool
-          let execResult = await this.toolExecutor.execute(modifiedToolCall);
+          let execResult = await this.toolExecutor.execute(modifiedToolCall, { signal });
 
           // Run afterToolCall middleware
           execResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
@@ -302,6 +314,13 @@ export class Agent {
         }
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
+
+        // Abort is terminal — do not treat as recoverable LLM error
+        if (signal.aborted || isAbortError(err)) {
+          result.response = 'Agent run was aborted.';
+          return result;
+        }
+
         this.events.onError?.(err);
 
         // Run onError middleware

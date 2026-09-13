@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { defineTool } from '../core/tool-executor.js';
+import { createAbortError, throwIfAborted } from '../utils/abort.js';
 
 // ============================================================================
 // Shell Command Tools
@@ -12,6 +13,15 @@ export interface ShellResult {
   stderr: string;
   durationMs: number;
   killed: boolean;
+}
+
+function killChild(child: ReturnType<typeof spawn>): void {
+  child.kill('SIGTERM');
+  setTimeout(() => {
+    if (!child.killed) {
+      child.kill('SIGKILL');
+    }
+  }, 5000);
 }
 
 /**
@@ -56,7 +66,9 @@ export const shellExecTool = defineTool<
     },
     required: ['command'],
   },
-  execute: async ({ command, args = [], cwd, timeout = 60000, env = {} }) => {
+  execute: async ({ command, args = [], cwd, timeout = 60000, env = {} }, signal) => {
+    throwIfAborted(signal);
+
     const startTime = Date.now();
     const maxTimeout = Math.min(timeout, 300000); // Max 5 minutes
 
@@ -64,6 +76,16 @@ export const shellExecTool = defineTool<
       let stdout = '';
       let stderr = '';
       let killed = false;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
 
       const child = spawn(command, args, {
         cwd,
@@ -71,11 +93,19 @@ export const shellExecTool = defineTool<
         shell: false,
       });
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         killed = true;
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 5000);
+        killChild(child);
       }, maxTimeout);
+
+      const onAbort = () => {
+        killed = true;
+        killChild(child);
+        settle(() => {
+          reject(signal?.reason instanceof Error ? signal.reason : createAbortError());
+        });
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       child.stdout.on('data', (data) => {
         stdout += data.toString();
@@ -95,20 +125,24 @@ export const shellExecTool = defineTool<
       });
 
       child.on('close', (code) => {
-        clearTimeout(timer);
-        resolve({
-          command: `${command} ${args.join(' ')}`.trim(),
-          exitCode: code ?? -1,
-          stdout,
-          stderr,
-          durationMs: Date.now() - startTime,
-          killed,
+        settle(() => {
+          if (signal?.aborted) {
+            reject(signal.reason instanceof Error ? signal.reason : createAbortError());
+            return;
+          }
+          resolve({
+            command: `${command} ${args.join(' ')}`.trim(),
+            exitCode: code ?? -1,
+            stdout,
+            stderr,
+            durationMs: Date.now() - startTime,
+            killed,
+          });
         });
       });
 
       child.on('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
+        settle(() => reject(error));
       });
     });
   },
@@ -150,7 +184,9 @@ export const shellRunTool = defineTool<
     },
     required: ['script'],
   },
-  execute: async ({ script, cwd, timeout = 60000, shell }) => {
+  execute: async ({ script, cwd, timeout = 60000, shell }, signal) => {
+    throwIfAborted(signal);
+
     const startTime = Date.now();
     const maxTimeout = Math.min(timeout, 300000);
 
@@ -158,6 +194,16 @@ export const shellRunTool = defineTool<
       let stdout = '';
       let stderr = '';
       let killed = false;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
 
       const shellPath = shell || (process.platform === 'win32' ? 'cmd.exe' : '/bin/sh');
       const shellArgs = process.platform === 'win32' ? ['/c', script] : ['-c', script];
@@ -167,11 +213,19 @@ export const shellRunTool = defineTool<
         env: process.env,
       });
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         killed = true;
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 5000);
+        killChild(child);
       }, maxTimeout);
+
+      const onAbort = () => {
+        killed = true;
+        killChild(child);
+        settle(() => {
+          reject(signal?.reason instanceof Error ? signal.reason : createAbortError());
+        });
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       child.stdout.on('data', (data) => {
         stdout += data.toString();
@@ -190,20 +244,24 @@ export const shellRunTool = defineTool<
       });
 
       child.on('close', (code) => {
-        clearTimeout(timer);
-        resolve({
-          command: script,
-          exitCode: code ?? -1,
-          stdout,
-          stderr,
-          durationMs: Date.now() - startTime,
-          killed,
+        settle(() => {
+          if (signal?.aborted) {
+            reject(signal.reason instanceof Error ? signal.reason : createAbortError());
+            return;
+          }
+          resolve({
+            command: script,
+            exitCode: code ?? -1,
+            stdout,
+            stderr,
+            durationMs: Date.now() - startTime,
+            killed,
+          });
         });
       });
 
       child.on('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
+        settle(() => reject(error));
       });
     });
   },
@@ -228,18 +286,31 @@ export const commandExistsTool = defineTool<
     },
     required: ['command'],
   },
-  execute: async ({ command }) => {
+  execute: async ({ command }, signal) => {
+    throwIfAborted(signal);
+
     const whichCommand = process.platform === 'win32' ? 'where' : 'which';
 
-    return new Promise<{ command: string; exists: boolean; path?: string }>((resolve) => {
+    return new Promise<{ command: string; exists: boolean; path?: string }>((resolve, reject) => {
       const child = spawn(whichCommand, [command], { shell: false });
       let stdout = '';
+
+      const onAbort = () => {
+        killChild(child);
+        reject(signal?.reason instanceof Error ? signal.reason : createAbortError());
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       child.stdout.on('data', (data) => {
         stdout += data.toString();
       });
 
       child.on('close', (code) => {
+        signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) {
+          reject(signal.reason instanceof Error ? signal.reason : createAbortError());
+          return;
+        }
         if (code === 0 && stdout.trim()) {
           resolve({
             command,
@@ -252,6 +323,11 @@ export const commandExistsTool = defineTool<
       });
 
       child.on('error', () => {
+        signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) {
+          reject(signal.reason instanceof Error ? signal.reason : createAbortError());
+          return;
+        }
         resolve({ command, exists: false });
       });
     });

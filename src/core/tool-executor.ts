@@ -1,8 +1,16 @@
 import type { Tool, ToolCall, ToolExecutionResult, ToolSchema } from './types.js';
+import { isAbortError, throwIfAborted } from '../utils/abort.js';
 
 // ============================================================================
 // Tool Executor - Manages tool registration and execution
 // ============================================================================
+
+export interface ToolExecuteOptions {
+  /** Whether to use the result cache (default: true) */
+  useCache?: boolean;
+  /** Abort in-flight tool work when the agent aborts */
+  signal?: AbortSignal;
+}
 
 export class ToolExecutor {
   private tools: Map<string, Tool> = new Map();
@@ -119,12 +127,36 @@ export class ToolExecutor {
   }
 
   /**
-   * Execute a single tool call (with caching)
+   * Execute a single tool call (with caching).
+   * Second argument may be a boolean (legacy useCache) or options including signal.
    */
-  async execute(toolCall: ToolCall, useCache = true): Promise<ToolExecutionResult> {
+  async execute(
+    toolCall: ToolCall,
+    useCacheOrOptions: boolean | ToolExecuteOptions = true
+  ): Promise<ToolExecutionResult> {
+    const options: ToolExecuteOptions =
+      typeof useCacheOrOptions === 'boolean'
+        ? { useCache: useCacheOrOptions }
+        : useCacheOrOptions;
+    const useCache = options.useCache ?? true;
+    const signal = options.signal;
+
     const startTime = Date.now();
     const toolName = toolCall.function.name;
     const argsStr = toolCall.function.arguments || '{}';
+
+    try {
+      throwIfAborted(signal);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        toolCallId: toolCall.id,
+        toolName,
+        result: '',
+        error: `Tool execution aborted: ${errorMessage}`,
+        durationMs: Date.now() - startTime,
+      };
+    }
 
     const tool = this.tools.get(toolName);
 
@@ -166,8 +198,8 @@ export class ToolExecutor {
         };
       }
 
-      // Execute tool
-      const result = await tool.execute(args);
+      // Execute tool (forward abort signal when supported)
+      const result = await tool.execute(args, signal);
 
       // Convert result to string
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
@@ -185,11 +217,12 @@ export class ToolExecutor {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      const prefix = isAbortError(error) ? 'Tool execution aborted' : 'Tool execution failed';
       return {
         toolCallId: toolCall.id,
         toolName,
         result: '',
-        error: `Tool execution failed: ${errorMessage}`,
+        error: `${prefix}: ${errorMessage}`,
         durationMs: Date.now() - startTime,
       };
     }
@@ -198,17 +231,24 @@ export class ToolExecutor {
   /**
    * Execute multiple tool calls in parallel
    */
-  async executeMany(toolCalls: ToolCall[]): Promise<ToolExecutionResult[]> {
-    return Promise.all(toolCalls.map((tc) => this.execute(tc)));
+  async executeMany(
+    toolCalls: ToolCall[],
+    options?: ToolExecuteOptions
+  ): Promise<ToolExecutionResult[]> {
+    return Promise.all(toolCalls.map((tc) => this.execute(tc, options ?? true)));
   }
 
   /**
    * Execute multiple tool calls sequentially
    */
-  async executeManySequential(toolCalls: ToolCall[]): Promise<ToolExecutionResult[]> {
+  async executeManySequential(
+    toolCalls: ToolCall[],
+    options?: ToolExecuteOptions
+  ): Promise<ToolExecutionResult[]> {
     const results: ToolExecutionResult[] = [];
     for (const tc of toolCalls) {
-      results.push(await this.execute(tc));
+      throwIfAborted(options?.signal);
+      results.push(await this.execute(tc, options ?? true));
     }
     return results;
   }
@@ -264,7 +304,9 @@ export class ToolBuilder<TInput = unknown> {
   /**
    * Build the tool with an execute function
    */
-  execute<TOutput>(fn: (args: TInput) => Promise<TOutput>): Tool<TInput, TOutput> {
+  execute<TOutput>(
+    fn: (args: TInput, signal?: AbortSignal) => Promise<TOutput>
+  ): Tool<TInput, TOutput> {
     if (!this._name) {
       throw new Error('Tool name is required');
     }
@@ -295,7 +337,7 @@ export function defineTool<TInput, TOutput>(config: {
   name: string;
   description: string;
   parameters: ToolSchema;
-  execute: (args: TInput) => Promise<TOutput>;
+  execute: (args: TInput, signal?: AbortSignal) => Promise<TOutput>;
 }): Tool<TInput, TOutput> {
   return {
     name: config.name,

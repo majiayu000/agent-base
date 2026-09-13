@@ -1,4 +1,5 @@
 import { defineTool } from '../core/tool-executor.js';
+import { createAbortError, mergeAbortSignals, throwIfAborted } from '../utils/abort.js';
 
 // ============================================================================
 // HTTP Request Tools
@@ -40,9 +41,12 @@ export const httpGetTool = defineTool<
     },
     required: ['url'],
   },
-  execute: async ({ url, headers = {}, timeout = 30000 }) => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+  execute: async ({ url, headers = {}, timeout = 30000 }, signal) => {
+    throwIfAborted(signal);
+
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(createAbortError('Request timed out')), timeout);
+    const requestSignal = mergeAbortSignals(timeoutController.signal, signal);
 
     try {
       const response = await fetch(url, {
@@ -51,7 +55,7 @@ export const httpGetTool = defineTool<
           'User-Agent': 'AgentBase/1.0',
           ...headers,
         },
-        signal: controller.signal,
+        signal: requestSignal,
       });
 
       const body = await response.text();
@@ -116,9 +120,12 @@ export const httpPostTool = defineTool<
     },
     required: ['url'],
   },
-  execute: async ({ url, body, headers = {}, contentType = 'json', timeout = 30000 }) => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+  execute: async ({ url, body, headers = {}, contentType = 'json', timeout = 30000 }, signal) => {
+    throwIfAborted(signal);
+
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(createAbortError('Request timed out')), timeout);
+    const requestSignal = mergeAbortSignals(timeoutController.signal, signal);
 
     let requestBody: string | undefined;
     const requestHeaders: Record<string, string> = {
@@ -152,7 +159,7 @@ export const httpPostTool = defineTool<
         method: 'POST',
         headers: requestHeaders,
         body: requestBody,
-        signal: controller.signal,
+        signal: requestSignal,
       });
 
       const responseBody = await response.text();
@@ -198,13 +205,16 @@ export const fetchJsonTool = defineTool<
     },
     required: ['url'],
   },
-  execute: async ({ url, headers = {} }) => {
+  execute: async ({ url, headers = {} }, signal) => {
+    throwIfAborted(signal);
+
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'AgentBase/1.0',
         ...headers,
       },
+      signal,
     });
 
     if (!response.ok) {

@@ -93,7 +93,7 @@ export function createValidatedTool<TInput extends z.ZodRawShape, TOutput>(confi
   name: string;
   description: string;
   schema: z.ZodObject<TInput>;
-  execute: (args: z.infer<z.ZodObject<TInput>>) => Promise<TOutput>;
+  execute: (args: z.infer<z.ZodObject<TInput>>, signal?: AbortSignal) => Promise<TOutput>;
 }): Tool<z.infer<z.ZodObject<TInput>>, TOutput> {
   const { name, description, schema, execute } = config;
 
@@ -101,10 +101,10 @@ export function createValidatedTool<TInput extends z.ZodRawShape, TOutput>(confi
     name,
     description,
     parameters: zodToJsonSchema(schema),
-    execute: async (args: unknown) => {
+    execute: async (args: unknown, signal?: AbortSignal) => {
       // Validate input using Zod
       const parsed = schema.parse(args);
-      return execute(parsed);
+      return execute(parsed, signal);
     },
   };
 }
@@ -118,9 +118,9 @@ export function withValidation<TInput, TOutput>(
 ): Tool<TInput, TOutput> {
   return {
     ...tool,
-    execute: async (args: TInput) => {
+    execute: async (args: TInput, signal?: AbortSignal) => {
       const validated = schema.parse(args);
-      return tool.execute(validated);
+      return tool.execute(validated, signal);
     },
   };
 }

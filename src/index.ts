@@ -13,6 +13,7 @@ export { ContextManager } from './core/context-manager.js';
 export type { ContextManagerOptions } from './core/context-manager.js';
 
 export { ToolExecutor, ToolBuilder, createTool, defineTool } from './core/tool-executor.js';
+export type { ToolExecuteOptions } from './core/tool-executor.js';
 
 // Type exports
 export type {
@@ -113,6 +114,14 @@ export {
   commonSchemas,
   validatedCalculatorTool,
 } from './utils/validation.js';
+
+export {
+  abortableDelay,
+  createAbortError,
+  isAbortError,
+  mergeAbortSignals,
+  throwIfAborted,
+} from './utils/abort.js';
 
 // Utilities - Token Tracker
 export {

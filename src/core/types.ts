@@ -84,8 +84,11 @@ export interface Tool<TInput = unknown, TOutput = unknown> {
   description: string;
   /** JSON Schema for input parameters */
   parameters: ToolSchema;
-  /** Execute the tool with parsed arguments */
-  execute: (args: TInput) => Promise<TOutput>;
+  /**
+   * Execute the tool with parsed arguments.
+   * Optional AbortSignal cancels in-flight work when the agent aborts.
+   */
+  execute: (args: TInput, signal?: AbortSignal) => Promise<TOutput>;
 }
 
 // ============================================================================
