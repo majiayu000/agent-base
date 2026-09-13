@@ -103,6 +103,16 @@ export type {
   AgentMiddleware,
 } from './utils/middleware.js';
 
+// Utilities - Path safety (workspace containment)
+export {
+  resolveWithinWorkspace,
+  getWorkspaceRoot,
+  setWorkspaceRoot,
+  isPathInsideRoot,
+  assertNotSensitiveBasename,
+} from './utils/path-safety.js';
+export type { ResolveWithinWorkspaceOptions } from './utils/path-safety.js';
+
 // Utilities - Validation
 export {
   zodToJsonSchema,

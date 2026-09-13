@@ -1,6 +1,10 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
+import {
+  assertNotSensitiveBasename,
+  resolveWithinWorkspace,
+} from '../utils/path-safety.js';
 
 // ============================================================================
 // Filesystem Tools
@@ -14,13 +18,15 @@ export const readFileTool = defineTool<
   { path: string; content: string; size: number; encoding: string }
 >({
   name: 'read_file',
-  description: 'Read the contents of a file. Supports text files (utf-8) and binary files (base64).',
+  description:
+    'Read the contents of a file within the workspace. Supports text files (utf-8) and binary files (base64). Paths outside the workspace root are rejected.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'The file path to read (absolute or relative to working directory)',
+        description:
+          'The file path to read (absolute or relative to the workspace root). Must stay inside the workspace.',
       },
       encoding: {
         type: 'string',
@@ -31,7 +37,7 @@ export const readFileTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: filePath, encoding = 'utf-8' }) => {
-    const absolutePath = path.resolve(filePath);
+    const absolutePath = await resolveWithinWorkspace(filePath);
     const stats = await fs.stat(absolutePath);
 
     if (!stats.isFile()) {
@@ -64,13 +70,14 @@ export const writeFileTool = defineTool<
   { path: string; bytesWritten: number; created: boolean }
 >({
   name: 'write_file',
-  description: 'Write content to a file. Creates the file if it does not exist.',
+  description:
+    'Write content to a file within the workspace. Creates the file if it does not exist. Paths outside the workspace and sensitive basenames (.env, *.pem, id_rsa) are rejected.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'The file path to write to',
+        description: 'The file path to write to (must stay inside the workspace)',
       },
       content: {
         type: 'string',
@@ -89,7 +96,8 @@ export const writeFileTool = defineTool<
     required: ['path', 'content'],
   },
   execute: async ({ path: filePath, content, encoding = 'utf-8', createDirs = true }) => {
-    const absolutePath = path.resolve(filePath);
+    const absolutePath = await resolveWithinWorkspace(filePath);
+    assertNotSensitiveBasename(absolutePath);
 
     // Check if file exists
     let created = false;
@@ -124,13 +132,14 @@ export const listDirectoryTool = defineTool<
   { path: string; entries: Array<{ name: string; type: 'file' | 'directory'; size?: number }> }
 >({
   name: 'list_directory',
-  description: 'List contents of a directory. Can list files recursively and filter by pattern.',
+  description:
+    'List contents of a directory within the workspace. Can list files recursively and filter by pattern. Paths outside the workspace root are rejected.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'The directory path to list',
+        description: 'The directory path to list (must stay inside the workspace)',
       },
       recursive: {
         type: 'boolean',
@@ -144,7 +153,7 @@ export const listDirectoryTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: dirPath, recursive = false, pattern }) => {
-    const absolutePath = path.resolve(dirPath);
+    const absolutePath = await resolveWithinWorkspace(dirPath);
     const entries: Array<{ name: string; type: 'file' | 'directory'; size?: number }> = [];
 
     async function listDir(currentPath: string, prefix = '') {
@@ -206,19 +215,20 @@ export const fileInfoTool = defineTool<
   }
 >({
   name: 'file_info',
-  description: 'Get detailed information about a file or directory.',
+  description:
+    'Get detailed information about a file or directory within the workspace. Paths outside the workspace root are rejected.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'The file or directory path',
+        description: 'The file or directory path (must stay inside the workspace)',
       },
     },
     required: ['path'],
   },
   execute: async ({ path: filePath }) => {
-    const absolutePath = path.resolve(filePath);
+    const absolutePath = await resolveWithinWorkspace(filePath);
 
     try {
       const stats = await fs.stat(absolutePath);
@@ -258,13 +268,14 @@ export const deleteTool = defineTool<
   { path: string; deleted: boolean }
 >({
   name: 'delete_path',
-  description: 'Delete a file or directory. Use recursive=true for non-empty directories.',
+  description:
+    'Delete a file or directory within the workspace. Use recursive=true for non-empty directories. Paths outside the workspace and sensitive basenames (.env, *.pem, id_rsa) are rejected.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'The file or directory path to delete',
+        description: 'The file or directory path to delete (must stay inside the workspace)',
       },
       recursive: {
         type: 'boolean',
@@ -274,7 +285,8 @@ export const deleteTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: targetPath, recursive = false }) => {
-    const absolutePath = path.resolve(targetPath);
+    const absolutePath = await resolveWithinWorkspace(targetPath);
+    assertNotSensitiveBasename(absolutePath);
 
     try {
       const stats = await fs.stat(absolutePath);
