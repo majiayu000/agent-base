@@ -167,10 +167,15 @@ export const roundRobinStrategy: CoordinationStrategy = {
       return firstWorker ?? null;
     }
 
-    // Round-robin selection based on completed task count per worker
+    // Round-robin selection based on assigned load per worker.
+    // Include in_progress so concurrent batch assignment (maxConcurrentTasks > 1)
+    // does not dump every slot onto the first capable worker before any complete.
     const taskCounts = new Map<string, number>();
     for (const [, t] of context.tasks) {
-      if (t.status === 'completed' && t.assignedWorkerId) {
+      if (
+        (t.status === 'completed' || t.status === 'in_progress') &&
+        t.assignedWorkerId
+      ) {
         taskCounts.set(
           t.assignedWorkerId,
           (taskCounts.get(t.assignedWorkerId) || 0) + 1
@@ -178,7 +183,7 @@ export const roundRobinStrategy: CoordinationStrategy = {
       }
     }
 
-    // Select worker with fewest completed tasks
+    // Select worker with fewest assigned (completed + in-progress) tasks
     let minCount = Infinity;
     let selectedWorker = capableWorkers[0];
     for (const workerId of capableWorkers) {

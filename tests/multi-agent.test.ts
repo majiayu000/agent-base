@@ -399,6 +399,52 @@ describe('Multi-Agent Pattern', () => {
         }
       });
 
+      it('should distribute concurrent batch assignments across capable workers', async () => {
+        const assignmentOrder: string[] = [];
+        const releaseGates = new Map<string, () => void>();
+
+        const holdUntilReleased = (workerId: string) =>
+          createWorker(createTestRole(workerId, ['process']), async (task) => {
+            assignmentOrder.push(workerId);
+            await new Promise<void>((resolve) => {
+              releaseGates.set(task.id, resolve);
+            });
+            return task.input;
+          });
+
+        const coordinator = createCoordinator({
+          strategy: roundRobinStrategy,
+          maxConcurrentTasks: 4,
+        })
+          .registerWorker(holdUntilReleased('w1'))
+          .registerWorker(holdUntilReleased('w2'))
+          .addTasks([
+            { id: 't1', description: 'Process task', input: 1 },
+            { id: 't2', description: 'Process task', input: 2 },
+            { id: 't3', description: 'Process task', input: 3 },
+            { id: 't4', description: 'Process task', input: 4 },
+          ]);
+
+        const executePromise = coordinator.execute();
+
+        // Wait until the concurrent batch has assigned all four tasks
+        for (let i = 0; i < 50 && assignmentOrder.length < 4; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        expect(assignmentOrder).toHaveLength(4);
+        const w1Count = assignmentOrder.filter((id) => id === 'w1').length;
+        const w2Count = assignmentOrder.filter((id) => id === 'w2').length;
+        expect(w1Count).toBe(2);
+        expect(w2Count).toBe(2);
+        expect(assignmentOrder).toEqual(['w1', 'w2', 'w1', 'w2']);
+
+        for (const release of releaseGates.values()) {
+          release();
+        }
+        await executePromise;
+      });
+
       it('should balance by assignedWorkerId while preserving assignedRole preference', async () => {
         const taskAssignments: string[] = [];
 
