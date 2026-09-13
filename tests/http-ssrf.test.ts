@@ -455,6 +455,43 @@ describe('safeFetch redirect semantics', () => {
     }
   });
 
+  it('rejects non-safelisted methods in no-cors mode before any network attempt', async () => {
+    const original = globalThis.fetch;
+    const fetchMock = mock(() => {
+      throw new Error('fetch should not be called for no-cors non-safelisted methods');
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      for (const method of ['PUT', 'PATCH', 'DELETE']) {
+        await expect(
+          safeFetch('https://1.1.1.1/', { method, mode: 'no-cors' })
+        ).rejects.toThrow(/no-cors/i);
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('allows GET/HEAD/POST in no-cors mode', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () => new Response('ok', { status: 200 })) as typeof fetch;
+
+    try {
+      for (const method of ['GET', 'HEAD', 'POST']) {
+        const response = await safeFetch('https://1.1.1.1/', {
+          method,
+          mode: 'no-cors',
+          ...(method === 'POST' ? { body: 'x' } : {}),
+        });
+        expect(response.status).toBe(200);
+      }
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it('returns redirect responses that omit Location unchanged', async () => {
     const original = globalThis.fetch;
     globalThis.fetch = (async () =>
@@ -468,6 +505,34 @@ describe('safeFetch redirect semantics', () => {
       expect(response.status).toBe(302);
       expect(await response.text()).toBe('missing location');
       expect(response.headers.get('location')).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('does not retry ReadableStream bodies after the first transport failure', async () => {
+    const original = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      throw new Error(`transport failure #${attempts}`);
+    }) as typeof fetch;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('once'));
+        controller.close();
+      },
+    });
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/stream-once', {
+          method: 'PUT',
+          body: stream,
+        })
+      ).rejects.toThrow(/transport failure #1/);
+      expect(attempts).toBe(1);
     } finally {
       globalThis.fetch = original;
     }

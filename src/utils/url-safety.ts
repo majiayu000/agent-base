@@ -403,9 +403,10 @@ export async function safeFetch(
   const initialMethod = normalizeMethod(fetchInit.method);
   assertAllowedFetchMethod(initialMethod);
   assertMethodBodyCompatible(initialMethod, fetchInit.body);
+  const requestMode = fetchInit.mode ?? 'cors';
+  assertNoCorsMethodAllowed(requestMode, initialMethod);
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
-  const requestMode = fetchInit.mode ?? 'cors';
   const initialOrigin = new URL(url).origin;
 
   for (let i = 0; i <= maxRedirects; i++) {
@@ -525,7 +526,14 @@ async function prepareNodeBody(
   headers: Headers
 ): Promise<PreparedNodeBody | undefined> {
   if (body === undefined || body === null) return undefined;
-  if (typeof body === 'string' || Buffer.isBuffer(body)) {
+  if (typeof body === 'string') {
+    // Match Fetch: string bodies default to text/plain;charset=UTF-8.
+    if (!headers.has('content-type')) {
+      headers.set('content-type', 'text/plain;charset=UTF-8');
+    }
+    return { kind: 'buffer', value: body };
+  }
+  if (Buffer.isBuffer(body)) {
     return { kind: 'buffer', value: body };
   }
   if (body instanceof Uint8Array) {
@@ -622,6 +630,8 @@ async function pipeWebStreamToRequest(
 
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE']);
 const FORBIDDEN_FETCH_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
+/** Fetch CORS-safelisted methods — the only methods allowed in no-cors mode. */
+const NO_CORS_METHODS = new Set(['GET', 'HEAD', 'POST']);
 
 function normalizeMethod(method: string | undefined): string {
   return (method ?? 'GET').toUpperCase();
@@ -642,8 +652,26 @@ function assertMethodBodyCompatible(
   }
 }
 
+function assertNoCorsMethodAllowed(
+  mode: RequestInit['mode'] | undefined,
+  method: string
+): void {
+  if (mode === 'no-cors' && !NO_CORS_METHODS.has(method)) {
+    throw new TypeError(`'${method}' is not allowed in 'no-cors' mode.`);
+  }
+}
+
 function isIdempotentMethod(method: string): boolean {
   return IDEMPOTENT_METHODS.has(method);
+}
+
+/** ReadableStream bodies are one-shot; do not retry them across addresses. */
+function isReplayableBody(body: BodyInit | null | undefined): boolean {
+  if (body == null) return true;
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+    return false;
+  }
+  return true;
 }
 
 async function pinnedFetch(
@@ -663,10 +691,10 @@ async function pinnedFetch(
 
   const useBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
   let lastError: unknown;
-  const idempotent = isIdempotentMethod(method);
+  // Only retry after transport errors for idempotent methods with replayable bodies —
+  // otherwise a POST/PATCH may have already been processed, or a ReadableStream is locked.
+  const canRetry = isIdempotentMethod(method) && isReplayableBody(init.body);
 
-  // Try validated addresses in resolver order. Only retry after transport errors
-  // for idempotent methods — otherwise a POST/PATCH may have already been processed.
   for (let i = 0; i < validated.addresses.length; i++) {
     const pinned = validated.addresses[i];
     try {
@@ -680,7 +708,7 @@ async function pinnedFetch(
       }
       lastError = err;
       const moreAddresses = i < validated.addresses.length - 1;
-      if (!idempotent || !moreAddresses) {
+      if (!canRetry || !moreAddresses) {
         throw err instanceof Error
           ? err
           : new Error(`All validated addresses failed for ${validated.url.hostname}`);
@@ -894,22 +922,50 @@ async function nodePinnedFetch(
 }
 
 /**
- * Decode Content-Encoding like native Fetch, and strip encoding/length headers once decoded.
+ * Decode Content-Encoding like native Fetch (including multiple codings),
+ * and strip encoding/length headers once decoded.
  */
 function decodeContentEncoding(res: IncomingMessage, headers: Headers): Readable {
-  const encoding = String(headers.get('content-encoding') ?? '')
+  const encodingHeader = String(headers.get('content-encoding') ?? '')
     .toLowerCase()
     .trim();
-
-  let stream: Readable = res;
-  if (encoding === 'gzip' || encoding === 'x-gzip') {
-    stream = res.pipe(createGunzip());
-  } else if (encoding === 'deflate') {
-    stream = res.pipe(createInflate());
-  } else if (encoding === 'br') {
-    stream = res.pipe(createBrotliDecompress());
-  } else {
+  if (!encodingHeader) {
     return res;
+  }
+
+  const codings = encodingHeader
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0 && part !== 'identity');
+  if (codings.length === 0) {
+    headers.delete('content-encoding');
+    headers.delete('content-length');
+    return res;
+  }
+
+  // Validate every coding before piping so an unknown token cannot partially consume the body.
+  for (const coding of codings) {
+    if (
+      coding !== 'gzip' &&
+      coding !== 'x-gzip' &&
+      coding !== 'deflate' &&
+      coding !== 'br'
+    ) {
+      return res;
+    }
+  }
+
+  // Decode in reverse application order (Fetch-compatible).
+  let stream: Readable = res;
+  for (let i = codings.length - 1; i >= 0; i--) {
+    const coding = codings[i];
+    if (coding === 'gzip' || coding === 'x-gzip') {
+      stream = stream.pipe(createGunzip());
+    } else if (coding === 'deflate') {
+      stream = stream.pipe(createInflate());
+    } else {
+      stream = stream.pipe(createBrotliDecompress());
+    }
   }
 
   headers.delete('content-encoding');
