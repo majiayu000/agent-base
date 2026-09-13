@@ -358,6 +358,61 @@ describe('safeFetch redirect semantics', () => {
       globalThis.fetch = original;
     }
   });
+
+  it('rejects TRACK before any network attempt', async () => {
+    const original = globalThis.fetch;
+    const fetchMock = mock(() => {
+      throw new Error('fetch should not be called for TRACK');
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/', { method: 'TRACK' })
+      ).rejects.toThrow(/TRACK/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('rejects bodies on GET and HEAD before any network attempt', async () => {
+    const original = globalThis.fetch;
+    const fetchMock = mock(() => {
+      throw new Error('fetch should not be called for GET/HEAD with body');
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      await expect(
+        safeFetch('https://1.1.1.1/', { method: 'GET', body: 'nope' })
+      ).rejects.toThrow(/body/i);
+      await expect(
+        safeFetch('https://1.1.1.1/', { method: 'HEAD', body: 'nope' })
+      ).rejects.toThrow(/body/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('returns redirect responses that omit Location unchanged', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response('missing location', {
+        status: 302,
+        statusText: 'Found',
+      })) as typeof fetch;
+
+    try {
+      const response = await safeFetch('https://1.1.1.1/redirect');
+      expect(response.status).toBe(302);
+      expect(await response.text()).toBe('missing location');
+      expect(response.headers.get('location')).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });
 
 describe('HTTP tools SSRF guards (no network I/O)', () => {

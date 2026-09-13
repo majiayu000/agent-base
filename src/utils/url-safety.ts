@@ -340,7 +340,9 @@ export async function safeFetch(
   init: SafeFetchOptions = {}
 ): Promise<Response> {
   const { maxRedirects = 5, urlSafety, ...fetchInit } = init;
-  assertAllowedFetchMethod(normalizeMethod(fetchInit.method));
+  const initialMethod = normalizeMethod(fetchInit.method);
+  assertAllowedFetchMethod(initialMethod);
+  assertMethodBodyCompatible(initialMethod, fetchInit.body);
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
 
@@ -357,12 +359,13 @@ export async function safeFetch(
     }
 
     const location = response.headers.get('location');
+    // Native Fetch returns redirect responses without Location unchanged.
+    if (!location) {
+      return response;
+    }
+
     // Cancel unused redirect body so sockets are not held open.
     await cancelResponseBody(response);
-
-    if (!location) {
-      throw new Error(`Redirect (${response.status}) without Location header`);
-    }
 
     const nextUrl = new URL(location, current);
     const crossOrigin = !sameOrigin(current, nextUrl.href);
@@ -433,40 +436,117 @@ function stripIpv6Brackets(hostname: string): string {
   return hostname.replace(/^\[|\]$/g, '');
 }
 
+type PreparedNodeBody =
+  | { kind: 'buffer'; value: string | Buffer }
+  | { kind: 'stream'; stream: ReadableStream<Uint8Array> };
+
 /**
- * Serialize RequestInit body forms for the Node http(s) transport.
- * Uses Request to normalize URLSearchParams/FormData/Blob/ArrayBuffer/views.
+ * Prepare RequestInit body forms for the Node http(s) transport.
+ * ReadableStream is kept streaming so abort can cancel mid-upload;
+ * other forms are normalized via Request (URLSearchParams/FormData/Blob/…).
  */
-async function serializeNodeBody(
+async function prepareNodeBody(
   body: BodyInit | null | undefined,
   headers: Headers
-): Promise<string | Buffer | undefined> {
+): Promise<PreparedNodeBody | undefined> {
   if (body === undefined || body === null) return undefined;
-  if (typeof body === 'string' || Buffer.isBuffer(body)) return body;
-  if (body instanceof Uint8Array) return Buffer.from(body);
-  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (typeof body === 'string' || Buffer.isBuffer(body)) {
+    return { kind: 'buffer', value: body };
+  }
+  if (body instanceof Uint8Array) {
+    return { kind: 'buffer', value: Buffer.from(body) };
+  }
+  if (body instanceof ArrayBuffer) {
+    return { kind: 'buffer', value: Buffer.from(body) };
+  }
   if (ArrayBuffer.isView(body)) {
-    return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    return {
+      kind: 'buffer',
+      value: Buffer.from(body.buffer, body.byteOffset, body.byteLength),
+    };
   }
 
-  // Request normalizes FormData / Blob / URLSearchParams / ReadableStream.
-  // Node requires duplex:'half' when the body is a ReadableStream.
-  const streamBody =
-    typeof ReadableStream !== 'undefined' && body instanceof ReadableStream;
+  // Keep ReadableStream abortable — do not materialize the whole upload first.
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+    return { kind: 'stream', stream: body as ReadableStream<Uint8Array> };
+  }
+
   const tmp = new Request('http://local.invalid', {
     method: 'POST',
     body,
-    ...(streamBody ? ({ duplex: 'half' } as RequestInit) : {}),
   });
   const contentType = tmp.headers.get('content-type');
   if (contentType && !headers.has('content-type')) {
     headers.set('content-type', contentType);
   }
-  return Buffer.from(await tmp.arrayBuffer());
+  return { kind: 'buffer', value: Buffer.from(await tmp.arrayBuffer()) };
+}
+
+/**
+ * Pipe a web ReadableStream to a Node ClientRequest with backpressure and abort.
+ */
+async function pipeWebStreamToRequest(
+  stream: ReadableStream<Uint8Array>,
+  req: http.ClientRequest,
+  signal?: AbortSignal | null
+): Promise<void> {
+  const reader = stream.getReader();
+  let onAbort: (() => void) | undefined;
+
+  if (signal) {
+    if (signal.aborted) {
+      await reader.cancel(signal.reason).catch(() => undefined);
+      throw abortError(signal.reason);
+    }
+    onAbort = () => {
+      void reader.cancel(signal.reason).catch(() => undefined);
+      req.destroy(abortError(signal.reason));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        throw abortError(signal.reason);
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+
+      const chunk = Buffer.from(value);
+      if (!req.write(chunk)) {
+        await new Promise<void>((resolve, reject) => {
+          const onDrain = () => {
+            cleanup();
+            resolve();
+          };
+          const onError = (err: Error) => {
+            cleanup();
+            reject(err);
+          };
+          const cleanup = () => {
+            req.off('drain', onDrain);
+            req.off('error', onError);
+          };
+          req.once('drain', onDrain);
+          req.once('error', onError);
+        });
+      }
+    }
+    req.end();
+  } catch (err) {
+    await reader.cancel(err).catch(() => undefined);
+    throw err;
+  } finally {
+    if (signal && onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
 }
 
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE']);
-const FORBIDDEN_FETCH_METHODS = new Set(['CONNECT', 'TRACE']);
+const FORBIDDEN_FETCH_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
 
 function normalizeMethod(method: string | undefined): string {
   return (method ?? 'GET').toUpperCase();
@@ -475,6 +555,15 @@ function normalizeMethod(method: string | undefined): string {
 function assertAllowedFetchMethod(method: string): void {
   if (FORBIDDEN_FETCH_METHODS.has(method)) {
     throw new TypeError(`'${method}' HTTP method is unsupported.`);
+  }
+}
+
+function assertMethodBodyCompatible(
+  method: string,
+  body: BodyInit | null | undefined
+): void {
+  if (body != null && (method === 'GET' || method === 'HEAD')) {
+    throw new TypeError(`Request with ${method} method cannot have a body.`);
   }
 }
 
@@ -490,6 +579,7 @@ async function pinnedFetch(
     typeof init.method === 'string' ? init.method : undefined
   );
   assertAllowedFetchMethod(method);
+  assertMethodBodyCompatible(method, init.body);
 
   if (!validated.addresses.length) {
     // DNS resolution disabled — fall back to normal fetch (no pin available).
@@ -569,7 +659,7 @@ async function nodePinnedFetch(
   // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
   headers.set('host', url.host);
 
-  const body = await serializeNodeBody(init.body ?? undefined, headers);
+  const body = await prepareNodeBody(init.body ?? undefined, headers);
 
   const headerObject: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -663,6 +753,9 @@ async function nodePinnedFetch(
     let onAbort: (() => void) | undefined;
     if (signal) {
       if (signal.aborted) {
+        if (body?.kind === 'stream') {
+          void body.stream.cancel(signal.reason).catch(() => undefined);
+        }
         req.destroy(abortError(signal.reason));
         settle(() => reject(abortError(signal.reason)));
         return;
@@ -697,8 +790,16 @@ async function nodePinnedFetch(
     });
 
     req.on('error', (err) => settle(() => reject(err)));
-    if (body !== undefined) {
-      req.write(body);
+
+    if (body?.kind === 'stream') {
+      void pipeWebStreamToRequest(body.stream, req, signal).catch((err) =>
+        settle(() => reject(err instanceof Error ? err : new Error(String(err))))
+      );
+      return;
+    }
+
+    if (body?.kind === 'buffer') {
+      req.write(body.value);
     }
     req.end();
   });
