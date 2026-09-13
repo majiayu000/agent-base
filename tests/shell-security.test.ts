@@ -154,6 +154,23 @@ describe('Shell security (SEC-07)', () => {
       expect(isPathInsideRoot('/', '/')).toBe(true);
       expect(assertAllowedCwd('/tmp', ['/'])).toBe(resolvePathForJail('/tmp'));
     });
+
+    it('allows legitimate directories whose relative name starts with two dots', () => {
+      const dotted = path.join(tmpRoot, '..cache');
+      fs.mkdirSync(dotted, { recursive: true });
+      expect(isPathInsideRoot(dotted, tmpRoot)).toBe(true);
+      expect(assertAllowedCwd(dotted, [tmpRoot])).toBe(resolvePathForJail(dotted));
+    });
+
+    it('honors explicit empty allowedCwdRoots as fail-closed', async () => {
+      const exec = createShellExecTool({
+        allowedCommands: ['echo'],
+        allowedCwdRoots: [],
+      });
+      await expect(
+        exec.execute({ command: 'echo', args: ['x'], cwd: tmpRoot })
+      ).rejects.toThrow(/no allowed cwd roots/);
+    });
   });
 
   describe('env scrubbing', () => {
@@ -166,6 +183,8 @@ describe('Shell security (SEC-07)', () => {
       expect(isSecretEnvKey('API_KEY')).toBe(true);
       expect(isSecretEnvKey('TOKEN')).toBe(true);
       expect(isSecretEnvKey('SECRET')).toBe(true);
+      expect(isSecretEnvKey('AWS_SECRET_ACCESS_KEY')).toBe(true);
+      expect(isSecretEnvKey('AWS_ACCESS_KEY_ID')).toBe(true);
       expect(isSecretEnvKey('PATH')).toBe(false);
       expect(isSecretEnvKey('HOME')).toBe(false);
     });
@@ -180,7 +199,9 @@ describe('Shell security (SEC-07)', () => {
 
     it('strips secret keys and dangerous hooks from child env', () => {
       const prev = process.env.TEST_HARNESS_API_KEY;
+      const prevAws = process.env.AWS_SECRET_ACCESS_KEY;
       process.env.TEST_HARNESS_API_KEY = 'super-secret';
+      process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
       try {
         const env = buildChildEnv(
           {
@@ -196,6 +217,7 @@ describe('Shell security (SEC-07)', () => {
           true
         );
         expect(env.TEST_HARNESS_API_KEY).toBeUndefined();
+        expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
         expect(env.OTHER_TOKEN).toBeUndefined();
         expect(env.API_KEY).toBeUndefined();
         expect(env.TOKEN).toBeUndefined();
@@ -209,6 +231,11 @@ describe('Shell security (SEC-07)', () => {
           delete process.env.TEST_HARNESS_API_KEY;
         } else {
           process.env.TEST_HARNESS_API_KEY = prev;
+        }
+        if (prevAws === undefined) {
+          delete process.env.AWS_SECRET_ACCESS_KEY;
+        } else {
+          process.env.AWS_SECRET_ACCESS_KEY = prevAws;
         }
       }
     });
@@ -240,6 +267,22 @@ describe('Shell security (SEC-07)', () => {
           process.env.SHELL_SEC_TEST_API_KEY = prev;
         }
       }
+    });
+  });
+
+  describe('PATH executable lookup', () => {
+    it('skips non-executable PATH hits and finds a later runnable file', () => {
+      const firstDir = path.join(tmpRoot, 'path-first');
+      const secondDir = path.join(tmpRoot, 'path-second');
+      fs.mkdirSync(firstDir, { recursive: true });
+      fs.mkdirSync(secondDir, { recursive: true });
+      const blocker = path.join(firstDir, 'mytool');
+      const runnable = path.join(secondDir, 'mytool');
+      fs.writeFileSync(blocker, '#!/bin/sh\necho blocked\n', { mode: 0o644 });
+      fs.writeFileSync(runnable, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+
+      const resolved = resolveAllowedCommand('mytool', ['mytool'], `${firstDir}${path.delimiter}${secondDir}`);
+      expect(resolved).toBe(fs.realpathSync(runnable));
     });
   });
 

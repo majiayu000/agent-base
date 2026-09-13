@@ -26,7 +26,10 @@ export interface ShellSecurityPolicy {
   allowShellRun?: boolean;
   /** Allowed executables for shell_exec (exact name or absolute path). Empty = deny all. */
   allowedCommands?: string[];
-  /** Resolved cwd must stay under one of these roots. Default: [process.cwd()]. */
+  /**
+   * Resolved cwd must stay under one of these roots.
+   * Omitted → default [process.cwd()]. Explicit [] stays empty (fail-closed).
+   */
   allowedCwdRoots?: string[];
   /** Strip secret-like keys and dangerous execution hooks from child env. Default: true. */
   scrubEnv?: boolean;
@@ -39,9 +42,12 @@ export interface ResolvedShellSecurityPolicy {
   scrubEnv: boolean;
 }
 
-/** Matches suffixed credentials and common unprefixed exact names (API_KEY, TOKEN, SECRET, PASSWORD). */
+/**
+ * Matches credential-like env keys: exact unprefixed names, common suffixes,
+ * and mid-key SECRET / PASSWORD / ACCESS_KEY (e.g. AWS_SECRET_ACCESS_KEY).
+ */
 const SECRET_ENV_KEY =
-  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET)$|PASSWORD$/i;
+  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET)|SECRET|PASSWORD|ACCESS_KEY/i;
 
 /** Env keys that can load/execute attacker-controlled code in child processes. */
 const DANGEROUS_ENV_KEYS = new Set(
@@ -82,10 +88,11 @@ export function resolveShellSecurityPolicy(
   return {
     allowShellRun: policy.allowShellRun ?? false,
     allowedCommands: policy.allowedCommands ?? [],
+    // Only default when the property is omitted; explicit [] must remain fail-closed.
     allowedCwdRoots:
-      policy.allowedCwdRoots && policy.allowedCwdRoots.length > 0
-        ? policy.allowedCwdRoots.map((root) => path.resolve(root))
-        : [process.cwd()],
+      policy.allowedCwdRoots === undefined
+        ? [process.cwd()]
+        : policy.allowedCwdRoots.map((root) => path.resolve(root)),
     scrubEnv: policy.scrubEnv ?? true,
   };
 }
@@ -128,13 +135,16 @@ export function resolvePathForJail(input: string): string {
   }
 }
 
-/** True if `child` is `parent` or a descendant (handles filesystem root `/` correctly). */
+/**
+ * True if `child` is `parent` or a descendant (handles filesystem root `/` correctly).
+ * Distinguishes parent traversal (`..` / `../x`) from legitimate names like `..cache`.
+ */
 export function isPathInsideRoot(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
-  return (
-    rel === '' ||
-    (!rel.startsWith('..') && !path.isAbsolute(rel))
-  );
+  if (rel === '') return true;
+  if (path.isAbsolute(rel)) return false;
+  if (rel === '..' || rel.startsWith(`..${path.sep}`)) return false;
+  return true;
 }
 
 function tryRealpath(filePath: string): string {
@@ -145,7 +155,11 @@ function tryRealpath(filePath: string): string {
   }
 }
 
-function isRunnableFile(filePath: string): boolean {
+/**
+ * True if the path is a regular file that can actually be executed.
+ * Non-executable regular files return false so PATH lookup continues.
+ */
+export function isRunnableFile(filePath: string): boolean {
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return false;
@@ -153,14 +167,19 @@ function isRunnableFile(filePath: string): boolean {
     return false;
   }
   if (process.platform === 'win32') {
-    return true;
+    const ext = path.extname(filePath).toLowerCase();
+    const pathext = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+      .toLowerCase()
+      .split(';')
+      .filter(Boolean);
+    // Extensionless files may still be runnable (e.g. shebang via association); accept only PATHEXT matches.
+    return pathext.includes(ext);
   }
   try {
     fs.accessSync(filePath, fs.constants.X_OK);
     return true;
   } catch {
-    // Some platforms mark common utilities without +x in restricted sandboxes; still accept regular files.
-    return true;
+    return false;
   }
 }
 
@@ -265,6 +284,9 @@ export function assertAllowedCwd(
   cwd: string | undefined,
   allowedCwdRoots: string[]
 ): string {
+  if (allowedCwdRoots.length === 0) {
+    throw new Error('shell denied: no allowed cwd roots configured');
+  }
   const resolved = resolvePathForJail(cwd ?? process.cwd());
   const allowed = allowedCwdRoots.some((root) => {
     const normalizedRoot = resolvePathForJail(root);

@@ -8,7 +8,8 @@ import type { AgentResult } from './core/types.js';
 
 /**
  * Local CLI opt-in policy — deny shell_run; small argv allowlist under cwd.
- * Omit general-purpose interpreters (node/npm/bun) so shell_exec cannot run arbitrary code.
+ * Omit general-purpose interpreters (node/npm/bun) and VCS tools (git) so
+ * shell_exec cannot run arbitrary code via aliases or script runners.
  */
 const cliShellTools = createShellTools({
   allowShellRun: false,
@@ -19,7 +20,6 @@ const cliShellTools = createShellTools({
     'cat',
     'head',
     'wc',
-    'git',
     'which',
   ],
   allowedCwdRoots: [process.cwd()],
