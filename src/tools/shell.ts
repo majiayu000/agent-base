@@ -17,6 +17,45 @@ export interface ShellResult {
 
 const KILL_ESCALATION_MS = 5000;
 
+/** Active detached shell children — cleaned up on parent process exit. */
+const activeChildren = new Set<ChildProcess>();
+let exitHookInstalled = false;
+
+function trackChild(child: ChildProcess): void {
+  activeChildren.add(child);
+  const untrack = () => {
+    activeChildren.delete(child);
+  };
+  child.once('close', untrack);
+  child.once('error', untrack);
+  installExitHook();
+}
+
+/**
+ * Synchronously terminate every tracked shell process tree.
+ * Used on parent shutdown where async SIGKILL escalation cannot run.
+ */
+export function killActiveShellChildren(): void {
+  for (const child of [...activeChildren]) {
+    killProcessTree(child, 'SIGTERM');
+    killProcessTree(child, 'SIGKILL');
+    activeChildren.delete(child);
+  }
+}
+
+function installExitHook(): void {
+  if (exitHookInstalled || typeof process === 'undefined' || typeof process.on !== 'function') {
+    return;
+  }
+  exitHookInstalled = true;
+
+  // process.exit / normal exit: kill detached groups the parent would otherwise orphan.
+  // Signal handlers are left to the host (e.g. CLI) so test runners are not disrupted.
+  process.on('exit', () => {
+    killActiveShellChildren();
+  });
+}
+
 function hasExited(child: ChildProcess): boolean {
   // exitCode/signalCode are set when the process exits; child.killed is true as
   // soon as a kill signal was *sent*, which must not skip SIGKILL escalation.
@@ -122,7 +161,7 @@ function spawnCommand(
   options: { cwd?: string; env?: NodeJS.ProcessEnv; shell?: boolean }
 ): ChildProcess {
   const isWindows = process.platform === 'win32';
-  return spawn(command, args, {
+  const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env,
     shell: options.shell ?? false,
@@ -131,6 +170,8 @@ function spawnCommand(
     detached: !isWindows,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  trackChild(child);
+  return child;
 }
 
 /**

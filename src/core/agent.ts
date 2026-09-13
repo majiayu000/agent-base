@@ -296,6 +296,11 @@ export class Agent {
           result.response = parsed.content;
           // Run onComplete middleware
           await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
+          // Abort may fire while awaiting onComplete (or from onComplete itself).
+          if (signal.aborted) {
+            result.response = 'Agent run was aborted.';
+            return result;
+          }
           return result;
         }
 
@@ -447,6 +452,11 @@ export class Agent {
     // Max iterations reached
     result.maxIterationsReached = true;
     await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
+    // Abort may fire while awaiting onComplete (or from onComplete itself).
+    if (signal.aborted) {
+      result.response = 'Agent run was aborted.';
+      return result;
+    }
     result.response = 'Maximum iterations reached. The task may not be complete.';
 
     return result;

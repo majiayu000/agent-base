@@ -3,7 +3,7 @@ import { createAgent } from './core/agent.js';
 import { builtinTools } from './tools/builtin.js';
 import { httpTools } from './tools/http.js';
 import { filesystemTools } from './tools/filesystem.js';
-import { shellTools } from './tools/shell.js';
+import { killActiveShellChildren, shellTools } from './tools/shell.js';
 import type { AgentResult } from './core/types.js';
 
 // ============================================================================
@@ -153,6 +153,12 @@ agent
   .registerTools(filesystemTools)
   .registerTools(shellTools);
 
+function shutdown(exitCode = 0): never {
+  agent.abort();
+  killActiveShellChildren();
+  process.exit(exitCode);
+}
+
 // Create readline interface
 const rl = readline.createInterface({
   input: process.stdin,
@@ -185,7 +191,7 @@ async function handleCommand(input: string): Promise<boolean> {
     case '/q':
       console.log(color('\nGoodbye! 👋\n', 'cyan'));
       rl.close();
-      process.exit(0);
+      shutdown(0);
 
     default:
       return false;
@@ -226,11 +232,17 @@ async function prompt(): Promise<void> {
   });
 }
 
-// Handle Ctrl+C gracefully
+// Handle Ctrl+C / readline close: abort the agent and kill detached shell groups.
 rl.on('close', () => {
   console.log(color('\n\nGoodbye! 👋\n', 'cyan'));
-  process.exit(0);
+  shutdown(0);
 });
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    shutdown(signal === 'SIGINT' ? 130 : 143);
+  });
+}
 
 // Main
 printBanner();

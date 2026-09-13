@@ -76,6 +76,7 @@ export {
   shellRunTool,
   commandExistsTool,
   shellTools,
+  killActiveShellChildren,
 } from './tools/shell.js';
 
 // Utilities - Logger

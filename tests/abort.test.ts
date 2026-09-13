@@ -11,7 +11,7 @@ import { ToolExecutor, defineTool } from '../src/core/tool-executor.js';
 import { Agent } from '../src/core/agent.js';
 import type { ToolCall } from '../src/core/types.js';
 import { httpGetTool } from '../src/tools/http.js';
-import { shellExecTool, shellRunTool } from '../src/tools/shell.js';
+import { shellExecTool, shellRunTool, killActiveShellChildren } from '../src/tools/shell.js';
 import { deleteTool, listDirectoryTool, writeFileTool } from '../src/tools/filesystem.js';
 import type { Stream } from 'openai/streaming';
 import type OpenAI from 'openai';
@@ -308,6 +308,53 @@ describe('shell_exec abort', () => {
 
     setTimeout(() => controller.abort(), 50);
     await expectAbort(pending);
+  }, 10_000);
+
+  it('killActiveShellChildren terminates tracked detached groups without abort', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const pidFile = join(tmpdir(), `agent-base-active-kill-${Date.now()}-${process.pid}.pid`);
+    const pending = shellRunTool.execute({
+      script: `sleep 60 & echo $! > "${pidFile}"; wait`,
+      timeout: 60_000,
+    });
+
+    try {
+      const started = Date.now();
+      while (!existsSync(pidFile) && Date.now() - started < 3000) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      const childPid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isFinite(childPid) && childPid > 0).toBe(true);
+
+      killActiveShellChildren();
+
+      const result = await pending;
+      expect(result.exitCode).not.toBe(0);
+
+      // Grandchild should be gone after synchronous process-group cleanup.
+      const gone = Date.now();
+      let alive = true;
+      while (Date.now() - gone < 3000) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((r) => setTimeout(r, 20));
+        } catch {
+          alive = false;
+          break;
+        }
+      }
+      expect(alive).toBe(false);
+    } finally {
+      try {
+        unlinkSync(pidFile);
+      } catch {
+        // best-effort cleanup of temp pid file
+      }
+    }
   }, 10_000);
 });
 
@@ -919,6 +966,45 @@ describe('Agent abort path regressions', () => {
       const result = await agent.run('hello');
       expect(result.response).not.toBe('Agent run was aborted.');
       expect(result.maxIterationsReached).toBe(true);
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('reports abort when aborted during onComplete middleware (tool-free run)', async () => {
+    let agent!: Agent;
+    agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 2, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      middlewares: [
+        {
+          onComplete: async () => {
+            agent.abort();
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          },
+        },
+      ],
+    });
+
+    async function* chunks() {
+      yield {
+        choices: [{ delta: { role: 'assistant', content: 'done without tools' }, finish_reason: null }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
     } finally {
       createStream.mockRestore();
     }
