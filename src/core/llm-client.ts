@@ -291,6 +291,11 @@ export async function parseStream(
       }
     }
 
+    // Abort during final-chunk callbacks (e.g. onToken → Agent.abort()) can
+    // finish the iterator normally with no further yielded chunk. Recheck
+    // before treating the parse as successful.
+    throwIfAborted(signal);
+
     // Convert tool calls map to array
     const toolCalls: ToolCall[] = Array.from(toolCallsMap.values())
       .filter((tc) => tc.id && tc.name)

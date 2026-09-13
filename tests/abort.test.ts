@@ -119,6 +119,36 @@ describe('parseStream abort', () => {
     await expectAbort(pending);
     expect(aborted).toBe(true);
   });
+
+  it('rejects when abort fires while handling the final chunk', async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    const streamController = {
+      abort: () => {
+        aborted = true;
+      },
+    };
+
+    async function* chunks() {
+      yield {
+        choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const stream = Object.assign(chunks(), { controller: streamController }) as unknown as Stream<
+      OpenAI.Chat.Completions.ChatCompletionChunk
+    >;
+
+    const pending = parseStream(stream, {
+      signal: controller.signal,
+      onToken: () => {
+        controller.abort();
+      },
+    });
+
+    await expectAbort(pending);
+    expect(aborted).toBe(true);
+  });
 });
 
 describe('ToolExecutor abort', () => {
@@ -245,6 +275,56 @@ describe('shell_run abort', () => {
       }
     }
   }, 10_000);
+
+  it('escalates to SIGKILL when a descendant ignores SIGTERM after the leader exits', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const controller = new AbortController();
+    const pidFile = join(tmpdir(), `agent-base-sigkill-esc-${Date.now()}-${process.pid}.pid`);
+
+    try {
+      const pending = shellRunTool.execute(
+        {
+          // Grandchild ignores SIGTERM; wrapper exits on abort SIGTERM so the
+          // old hasExited gate would skip SIGKILL and leave this alive.
+          script: `(trap '' TERM; sleep 60) & echo $! > "${pidFile}"; wait`,
+          timeout: 60_000,
+        },
+        controller.signal
+      );
+
+      const started = Date.now();
+      while (!existsSync(pidFile) && Date.now() - started < 3000) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      const childPid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isFinite(childPid) && childPid > 0).toBe(true);
+
+      controller.abort();
+      await expectAbort(pending);
+
+      // Wait past KILL_ESCALATION_MS (5s) for SIGKILL against the process group.
+      await new Promise((r) => setTimeout(r, 5500));
+      let stillAlive = false;
+      try {
+        process.kill(childPid, 0);
+        stillAlive = true;
+      } catch (err) {
+        stillAlive = false;
+        void err;
+      }
+      expect(stillAlive).toBe(false);
+    } finally {
+      try {
+        unlinkSync(pidFile);
+      } catch (err) {
+        void err;
+      }
+    }
+  }, 20_000);
 });
 
 describe('http_get abort', () => {

@@ -24,12 +24,31 @@ function hasExited(child: ChildProcess): boolean {
 }
 
 /**
+ * True when the POSIX process group still has at least one member.
+ * Used after the group leader exits so we can still escalate against orphans.
+ */
+function processGroupExists(pid: number): boolean {
+  if (process.platform === 'win32') {
+    return false;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Terminate a spawned process and its descendants.
  * POSIX: child is started in its own process group (detached); we signal -pid.
  * Windows: taskkill /T walks the process tree.
+ *
+ * Intentionally does not require the group leader to still be alive: a wrapper
+ * shell may exit on SIGTERM while descendants that ignore SIGTERM remain.
  */
 function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
-  if (hasExited(child) || child.pid == null) {
+  if (child.pid == null) {
     return;
   }
 
@@ -43,32 +62,39 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'
     return;
   }
 
+  // Skip only when both the leader and the process group are gone.
+  if (hasExited(child) && !processGroupExists(pid)) {
+    return;
+  }
+
   try {
     // Negative PID = process group (requires detached: true at spawn).
     process.kill(-pid, signal);
   } catch (err) {
-    // Fall back to signaling the direct child if the group is already gone.
-    try {
-      child.kill(signal);
-    } catch (fallbackErr) {
-      // Process may have exited between the check and the signal.
-      void err;
-      void fallbackErr;
+    // Fall back to signaling the direct child if it is still alive.
+    if (!hasExited(child)) {
+      try {
+        child.kill(signal);
+      } catch (fallbackErr) {
+        void fallbackErr;
+      }
     }
+    void err;
   }
 }
 
 function killChild(child: ChildProcess): void {
-  if (hasExited(child)) {
+  if (child.pid == null) {
     return;
   }
 
+  // Always attempt SIGTERM against the tree/group first.
   killProcessTree(child, 'SIGTERM');
 
   setTimeout(() => {
-    if (hasExited(child)) {
-      return;
-    }
+    // Escalate SIGKILL even if the group leader has exited — descendants that
+    // ignore SIGTERM may still be running and holding pipes open.
+    // killProcessTree itself no-ops only when the whole group is gone.
     killProcessTree(child, 'SIGKILL');
   }, KILL_ESCALATION_MS);
 }
