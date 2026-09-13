@@ -75,6 +75,14 @@ export {
   shellRunTool,
   commandExistsTool,
   shellTools,
+  createShellTools,
+  createShellExecTool,
+  createShellRunTool,
+  resolveShellSecurityPolicy,
+  buildChildEnv,
+  isSecretEnvKey,
+  assertAllowedCommand,
+  assertAllowedCwd,
 } from './tools/shell.js';
 
 // Utilities - Logger
@@ -131,7 +139,11 @@ export type { TokenUsage } from './core/llm-client.js';
 
 // Export tool result types
 export type { HttpResponse } from './tools/http.js';
-export type { ShellResult } from './tools/shell.js';
+export type {
+  ShellResult,
+  ShellSecurityPolicy,
+  ResolvedShellSecurityPolicy,
+} from './tools/shell.js';
 
 // All tools combined - import and re-export for convenience
 import { builtinTools as _builtinTools } from './tools/builtin.js';

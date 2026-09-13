@@ -3,8 +3,28 @@ import { createAgent } from './core/agent.js';
 import { builtinTools } from './tools/builtin.js';
 import { httpTools } from './tools/http.js';
 import { filesystemTools } from './tools/filesystem.js';
-import { shellTools } from './tools/shell.js';
+import { createShellTools } from './tools/shell.js';
 import type { AgentResult } from './core/types.js';
+
+/** Local CLI opt-in policy — still deny shell_run; allow a small argv allowlist under cwd. */
+const cliShellTools = createShellTools({
+  allowShellRun: false,
+  allowedCommands: [
+    'ls',
+    'pwd',
+    'echo',
+    'cat',
+    'head',
+    'wc',
+    'git',
+    'npm',
+    'bun',
+    'node',
+    'which',
+  ],
+  allowedCwdRoots: [process.cwd()],
+  scrubEnv: true,
+});
 
 // ============================================================================
 // CLI Interactive Mode
@@ -151,7 +171,7 @@ agent
   .registerTools(builtinTools)
   .registerTools(httpTools)
   .registerTools(filesystemTools)
-  .registerTools(shellTools);
+  .registerTools(cliShellTools);
 
 // Create readline interface
 const rl = readline.createInterface({
