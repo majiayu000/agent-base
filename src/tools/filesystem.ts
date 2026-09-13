@@ -4,7 +4,9 @@ import { defineTool } from '../core/tool-executor.js';
 import {
   assertLexicalEntryContained,
   assertNotSensitivePaths,
+  isPathInsideRoot,
   resolveWorkspacePath,
+  resolveWorkspacePathAllowingTargetEscape,
   revalidateContained,
 } from '../utils/path-safety.js';
 
@@ -238,6 +240,10 @@ export const fileInfoTool = defineTool<
   execute: async ({ path: filePath }) => {
     const { root, lexicalPath } = await resolveWorkspacePath(filePath);
     const absolutePath = await revalidateContained(lexicalPath, root);
+    // Require the lexical entry itself to live under the workspace before
+    // lstat — otherwise an absolute outside-workspace symlink to an
+    // in-workspace target would leak outside-path metadata.
+    await assertLexicalEntryContained(lexicalPath, root);
 
     try {
       // Prefer lstat so callers can see symlink identity at the lexical path.
@@ -308,21 +314,29 @@ export const deleteTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: targetPath, recursive = false }) => {
-    const { root, lexicalPath, realPath } = await resolveWorkspacePath(targetPath);
-    assertNotSensitivePaths(targetPath, realPath);
-    assertNotSensitivePaths(lexicalPath, realPath);
-
-    // Re-check target containment, then require the lexical entry itself to
-    // live under the workspace before mutating it. Otherwise an absolute
-    // outside-workspace symlink to an in-workspace file would pass the
-    // realpath check and still be unlinked outside the root.
-    await revalidateContained(lexicalPath, root);
+    // Soft-resolve so an in-workspace symlink whose target escapes can still
+    // be unlinked. Lexical-entry containment is required before any mutation;
+    // target containment is required only for non-symlink entries.
+    const { root, lexicalPath, realPath } =
+      await resolveWorkspacePathAllowingTargetEscape(targetPath);
+    assertNotSensitivePaths(targetPath, lexicalPath);
     await assertLexicalEntryContained(lexicalPath, root);
 
     try {
       const stats = await fs.lstat(lexicalPath);
 
-      if (stats.isSymbolicLink() || stats.isFile()) {
+      if (stats.isSymbolicLink()) {
+        await fs.unlink(lexicalPath);
+        return { path: lexicalPath, deleted: true };
+      }
+
+      if (!isPathInsideRoot(realPath, root)) {
+        throw new Error(`Path escapes workspace root (${root}): ${targetPath}`);
+      }
+      assertNotSensitivePaths(targetPath, realPath);
+      await revalidateContained(lexicalPath, root);
+
+      if (stats.isFile()) {
         await fs.unlink(lexicalPath);
       } else if (stats.isDirectory()) {
         await fs.rm(lexicalPath, { recursive });

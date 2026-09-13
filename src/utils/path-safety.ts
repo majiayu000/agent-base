@@ -145,7 +145,23 @@ async function realpathExistingPrefix(absolutePath: string): Promise<string> {
         const lst = await fs.lstat(current);
         if (lst.isSymbolicLink()) {
           const linkTarget = await fs.readlink(current);
-          const resolvedTarget = path.resolve(path.dirname(current), linkTarget);
+          // Relative link text is relative to the directory containing the
+          // link inode. When that parent was reached via another symlink
+          // (e.g. alias -> deep/real, link -> ../new.txt), dirname(current)
+          // is still lexical (alias/) and would resolve to the wrong place.
+          // Canonicalize the parent first.
+          const parentDir = path.dirname(current);
+          let parentCanonical: string;
+          try {
+            parentCanonical = await fs.realpath(parentDir);
+          } catch (parentError) {
+            const parentCode = (parentError as NodeJS.ErrnoException).code;
+            if (parentCode !== 'ENOENT') {
+              throw parentError;
+            }
+            parentCanonical = await realpathExistingPrefix(parentDir);
+          }
+          const resolvedTarget = path.resolve(parentCanonical, linkTarget);
           current =
             segments.length === 0
               ? resolvedTarget
@@ -212,7 +228,11 @@ async function resolveRoot(
       if (code !== 'ENOENT') {
         throw error;
       }
-      // Root may not exist yet; keep lexical resolve
+      // Root may not exist yet beneath a symlinked ancestor (e.g. new dir
+      // under macOS /tmp -> /private/tmp). Canonicalize the longest existing
+      // prefix and reattach the missing suffix so candidate realpaths compare
+      // against the same root form.
+      root = await realpathExistingPrefix(root);
     }
   }
 
@@ -252,6 +272,29 @@ export async function resolveWorkspacePath(
       `Path escapes workspace root (${root}): ${inputPath}`
     );
   }
+
+  return { root, lexicalPath, realPath };
+}
+
+/**
+ * Like {@link resolveWorkspacePath}, but does not reject when the canonical
+ * target escapes the workspace. Used by delete_path so an in-workspace
+ * symlink pointing outside can still be unlinked after lexical-entry checks.
+ */
+export async function resolveWorkspacePathAllowingTargetEscape(
+  inputPath: string,
+  options: ResolveWithinWorkspaceOptions = {}
+): Promise<WorkspacePath> {
+  if (typeof inputPath !== 'string' || inputPath.length === 0) {
+    throw new Error('Path must be a non-empty string');
+  }
+
+  const useRealpath = options.useRealpath !== false;
+  const root = await resolveRoot(options, useRealpath);
+  const lexicalPath = path.resolve(root, inputPath);
+  const realPath = useRealpath
+    ? await realpathExistingPrefix(lexicalPath)
+    : lexicalPath;
 
   return { root, lexicalPath, realPath };
 }

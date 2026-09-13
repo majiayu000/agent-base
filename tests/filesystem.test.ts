@@ -94,6 +94,36 @@ describe('resolveWithinWorkspace', () => {
     await expect(resolveWithinWorkspace('dangling-out')).rejects.toThrow(/escapes workspace/i);
   });
 
+  it('resolves relative dangling links against the canonical parent directory', async () => {
+    await fs.mkdir(path.join(workspace, 'deep', 'real'), { recursive: true });
+    await fs.symlink('deep/real', path.join(workspace, 'alias'));
+    await fs.symlink('../new.txt', path.join(workspace, 'deep', 'real', 'link'));
+
+    const resolved = await resolveWithinWorkspace('alias/link');
+    expect(resolved).toBe(path.join(realWorkspace, 'deep', 'new.txt'));
+  });
+
+  it('allows creating under a not-yet-existing root beneath a symlinked ancestor', async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-base-rootbase-'));
+    const realBase = await fs.realpath(base);
+    const aliasBase = path.join(
+      os.tmpdir(),
+      `agent-base-rootalias-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    const missingRoot = path.join(aliasBase, 'missing-child');
+    try {
+      await fs.symlink(realBase, aliasBase);
+      setWorkspaceRoot(missingRoot);
+
+      const resolved = await resolveWithinWorkspace('created.txt');
+      expect(resolved).toBe(path.join(await fs.realpath(aliasBase), 'missing-child', 'created.txt'));
+    } finally {
+      setWorkspaceRoot(workspace);
+      await fs.rm(aliasBase, { recursive: true, force: true });
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
   it('honors AGENT_BASE_WORKSPACE_ROOT when module config is cleared', async () => {
     setWorkspaceRoot(undefined);
     process.env.AGENT_BASE_WORKSPACE_ROOT = workspace;
@@ -221,6 +251,58 @@ describe('filesystem tools workspace guards', () => {
     } finally {
       await fs.rm(outsideDir, { recursive: true, force: true });
     }
+  });
+
+  it('file_info rejects absolute outside-workspace symlink to an in-workspace file', async () => {
+    const target = path.join(workspace, 'info-target.txt');
+    await fs.writeFile(target, 'meta');
+
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-base-out-info-'));
+    const outsideLink = path.join(outsideDir, 'outside-info-link');
+    try {
+      await fs.symlink(target, outsideLink);
+
+      await expect(fileInfoTool.execute({ path: outsideLink })).rejects.toThrow(
+        /escapes workspace/i
+      );
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('delete_path unlinks an in-workspace symlink that points outside the root', async () => {
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-base-out-target-'));
+    const outsideFile = path.join(outsideDir, 'outside.txt');
+    try {
+      await fs.writeFile(outsideFile, 'outside-keep');
+      await fs.symlink(outsideFile, path.join(workspace, 'link-outside.txt'));
+
+      const result = await deleteTool.execute({ path: 'link-outside.txt' });
+      expect(result.deleted).toBe(true);
+
+      await expect(fs.lstat(path.join(workspace, 'link-outside.txt'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      expect(await fs.readFile(outsideFile, 'utf-8')).toBe('outside-keep');
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('write_file through relative dangling link uses canonical parent', async () => {
+    await fs.mkdir(path.join(workspace, 'deep', 'real'), { recursive: true });
+    await fs.symlink('deep/real', path.join(workspace, 'alias'));
+    await fs.symlink('../new.txt', path.join(workspace, 'deep', 'real', 'link'));
+
+    const written = await writeFileTool.execute({
+      path: 'alias/link',
+      content: 'via-alias',
+    });
+    expect(written.path).toBe(path.join(realWorkspace, 'deep', 'new.txt'));
+    expect(await fs.readFile(path.join(workspace, 'deep', 'new.txt'), 'utf-8')).toBe('via-alias');
+    await expect(fs.access(path.join(workspace, 'new.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('delete_path unlinks an in-workspace symlink without deleting its target', async () => {
