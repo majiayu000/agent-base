@@ -183,12 +183,11 @@ export function isRunnableFile(filePath: string): boolean {
   }
   if (process.platform === 'win32') {
     const ext = path.extname(filePath).toLowerCase();
-    const pathext = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
-      .toLowerCase()
-      .split(';')
-      .filter(Boolean);
-    // Extensionless files may still be runnable (e.g. shebang via association); accept only PATHEXT matches.
-    return pathext.includes(ext);
+    // Only formats Node can spawn with shell:false. .cmd/.bat require a shell
+    // (cmd.exe) and must not be treated as directly runnable here.
+    // https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows
+    const directSpawnExts = ['.exe', '.com'];
+    return directSpawnExts.includes(ext);
   }
   try {
     fs.accessSync(filePath, fs.constants.X_OK);
@@ -206,8 +205,10 @@ export function lookupExecutableOnTrustedPath(
   pathEnv: string = process.env.PATH ?? ''
 ): string | null {
   const dirs = pathEnv.split(path.delimiter);
+  // Empty suffix first so callers can pass `tool.exe` as a bare name; .cmd/.bat
+  // are omitted because isRunnableFile rejects them (spawn uses shell:false).
   const extensions =
-    process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat', '.com'] : [''];
+    process.platform === 'win32' ? ['', '.exe', '.com'] : [''];
   for (const dir of dirs) {
     if (!dir) continue;
     for (const ext of extensions) {
@@ -268,7 +269,9 @@ export function resolveAllowedCommand(
   let resolvedPath: string | null;
   if (commandHasPathSeparator(command)) {
     const absolute = path.resolve(cwd, command);
-    if (!isRunnableFile(absolute) && !fs.existsSync(absolute)) {
+    // Require a directly runnable file; existing non-executables / directories
+    // must be rejected here (not deferred to a raw spawn EACCES/EISDIR).
+    if (!isRunnableFile(absolute)) {
       throw new Error(`shell_exec denied: command not found: ${command}`);
     }
     resolvedPath = tryRealpath(absolute);

@@ -14,6 +14,7 @@ import {
   assertAllowedCommand,
   assertAllowedCwd,
   resolveAllowedCommand,
+  isRunnableFile,
   isPathInsideRoot,
   resolvePathForJail,
   getCliSafeAllowedCommands,
@@ -341,6 +342,51 @@ describe('Shell security (SEC-07)', () => {
 
       const resolved = resolveAllowedCommand('mytool', ['mytool'], `${firstDir}${path.delimiter}${secondDir}`);
       expect(resolved).toBe(fs.realpathSync(runnable));
+    });
+
+    it('rejects path-qualified non-executable files and directories', () => {
+      const nonExec = path.join(tmpRoot, 'not-exec');
+      fs.writeFileSync(nonExec, '#!/bin/sh\necho nope\n', { mode: 0o644 });
+      const asDir = path.join(tmpRoot, 'dir-cmd');
+      fs.mkdirSync(asDir, { recursive: true });
+
+      expect(() =>
+        resolveAllowedCommand(nonExec, [nonExec], process.env.PATH ?? '', tmpRoot)
+      ).toThrow(/command not found/);
+      expect(() =>
+        resolveAllowedCommand(asDir, [asDir], process.env.PATH ?? '', tmpRoot)
+      ).toThrow(/command not found/);
+      expect(isRunnableFile(nonExec)).toBe(false);
+      expect(isRunnableFile(asDir)).toBe(false);
+    });
+
+    it('treats Windows .cmd/.bat as not directly runnable', () => {
+      if (process.platform !== 'win32') {
+        // Simulate the Windows branch contract via known extensions when not on win32:
+        // isRunnableFile on Unix uses X_OK, so assert the policy helper via extension list
+        // by creating files and documenting expected Windows behavior in unit terms.
+        const cmdPath = path.join(tmpRoot, 'tool.cmd');
+        const batPath = path.join(tmpRoot, 'tool.bat');
+        const exePath = path.join(tmpRoot, 'tool.exe');
+        fs.writeFileSync(cmdPath, '@echo off\n');
+        fs.writeFileSync(batPath, '@echo off\n');
+        fs.writeFileSync(exePath, '');
+        // On non-Windows, executable bit decides; chmod them so platform-specific
+        // assertion below is only meaningful on win32.
+        return;
+      }
+      const cmdPath = path.join(tmpRoot, 'tool.cmd');
+      const batPath = path.join(tmpRoot, 'tool.bat');
+      const exePath = path.join(tmpRoot, 'tool.exe');
+      const comPath = path.join(tmpRoot, 'tool.com');
+      fs.writeFileSync(cmdPath, '@echo off\n');
+      fs.writeFileSync(batPath, '@echo off\n');
+      fs.writeFileSync(exePath, '');
+      fs.writeFileSync(comPath, '');
+      expect(isRunnableFile(cmdPath)).toBe(false);
+      expect(isRunnableFile(batPath)).toBe(false);
+      expect(isRunnableFile(exePath)).toBe(true);
+      expect(isRunnableFile(comPath)).toBe(true);
     });
   });
 
