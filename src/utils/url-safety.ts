@@ -53,6 +53,109 @@ function stampLogicalUrl(response: Response, logicalUrl: string): Response {
   return response;
 }
 
+/** Match native Fetch: responses after following a redirect report redirected === true. */
+function stampRedirected(response: Response, redirected: boolean): Response {
+  if (redirected && !response.redirected) {
+    Object.defineProperty(response, 'redirected', {
+      value: true,
+      configurable: true,
+      enumerable: true,
+    });
+  }
+  return response;
+}
+
+/**
+ * Apply Fetch referrer / referrerPolicy to the outbound Referer header.
+ * Server-side `about:client` has no document URL, so it leaves Referer unchanged.
+ */
+function applyReferrerHeaders(
+  headers: Headers,
+  requestUrl: URL,
+  init: RequestInit
+): void {
+  const referrer = init.referrer;
+  if (referrer === undefined || referrer === 'about:client') {
+    return;
+  }
+  if (referrer === '') {
+    headers.delete('referer');
+    return;
+  }
+
+  let referrerUrl: URL;
+  try {
+    referrerUrl = new URL(referrer);
+  } catch {
+    return;
+  }
+
+  if (referrerUrl.protocol !== 'http:' && referrerUrl.protocol !== 'https:') {
+    headers.delete('referer');
+    return;
+  }
+
+  const policy = (init.referrerPolicy || 'strict-origin-when-cross-origin') as string;
+  const value = serializeReferrer(referrerUrl, requestUrl, policy);
+  if (value === null) {
+    headers.delete('referer');
+  } else {
+    headers.set('referer', value);
+  }
+}
+
+function originString(url: URL): string {
+  return `${url.protocol}//${url.host}`;
+}
+
+function isDowngrade(referrerUrl: URL, requestUrl: URL): boolean {
+  return referrerUrl.protocol === 'https:' && requestUrl.protocol !== 'https:';
+}
+
+function isSameOrigin(a: URL, b: URL): boolean {
+  return (
+    a.protocol === b.protocol &&
+    a.hostname.toLowerCase() === b.hostname.toLowerCase() &&
+    a.port === b.port
+  );
+}
+
+/** Serialize a referrer URL per Referrer-Policy (returns null for no-referrer). */
+function serializeReferrer(
+  referrerUrl: URL,
+  requestUrl: URL,
+  policy: string
+): string | null {
+  const full = referrerUrl.href;
+  const origin = originString(referrerUrl);
+  const sameOrigin = isSameOrigin(referrerUrl, requestUrl);
+  const downgrade = isDowngrade(referrerUrl, requestUrl);
+
+  switch (policy) {
+    case 'no-referrer':
+      return null;
+    case 'unsafe-url':
+      return full;
+    case 'origin':
+      return `${origin}/`;
+    case 'origin-when-cross-origin':
+      return sameOrigin ? full : `${origin}/`;
+    case 'same-origin':
+      return sameOrigin ? full : null;
+    case 'no-referrer-when-downgrade':
+      return downgrade ? null : full;
+    case 'strict-origin':
+      return downgrade ? null : `${origin}/`;
+    case 'strict-origin-when-cross-origin':
+    case '':
+      if (sameOrigin) return full;
+      return downgrade ? null : `${origin}/`;
+    default:
+      // Unknown policy — fail closed like no-referrer for safety.
+      return null;
+  }
+}
+
 export interface ValidatedSafeUrl {
   url: URL;
   /** Addresses that passed safety checks; used to pin the connection. */
@@ -409,6 +512,7 @@ export async function safeFetch(
   let current = url;
   let requestInit: RequestInit = { ...fetchInit };
   const initialOrigin = new URL(url).origin;
+  let followedRedirect = false;
 
   for (let i = 0; i <= maxRedirects; i++) {
     if (requestMode === 'same-origin') {
@@ -425,7 +529,10 @@ export async function safeFetch(
       signal: requestInit.signal ?? urlSafety?.signal,
     });
 
-    const response = stampLogicalUrl(await pinnedFetch(validated, requestInit), current);
+    const response = stampRedirected(
+      stampLogicalUrl(await pinnedFetch(validated, requestInit), current),
+      followedRedirect
+    );
 
     if (!REDIRECT_STATUS.has(response.status)) {
       return response;
@@ -444,6 +551,7 @@ export async function safeFetch(
     const crossOrigin = !sameOrigin(current, nextUrl.href);
     requestInit = nextRedirectInit(requestInit, response.status, crossOrigin);
     current = nextUrl.href;
+    followedRedirect = true;
   }
 
   throw new Error(`Too many redirects (limit ${maxRedirects})`);
@@ -760,12 +868,16 @@ async function bunPinnedFetch(
   const headers = new Headers(init.headers);
   // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
   headers.set('host', url.host);
+  applyReferrerHeaders(headers, url, init);
 
   const fetchInit: RequestInit & { tls?: { serverName: string } } = {
     ...init,
     headers,
     redirect: 'manual',
   };
+  // Referer is applied via headers; avoid double-application by the runtime.
+  delete fetchInit.referrer;
+  delete fetchInit.referrerPolicy;
   if (url.protocol === 'https:') {
     // Retain original hostname for SNI/cert checks when Bun honors it (IP-literal HTTPS).
     fetchInit.tls = { serverName: stripIpv6Brackets(url.hostname) };
@@ -783,6 +895,7 @@ async function nodePinnedFetch(
   const headers = new Headers(init.headers);
   // Always pin Host to the validated URL host so callers cannot smuggle virtual hosts.
   headers.set('host', url.host);
+  applyReferrerHeaders(headers, url, init);
 
   const body = await prepareNodeBody(init.body ?? undefined, headers);
 
@@ -820,6 +933,9 @@ async function nodePinnedFetch(
         path: `${url.pathname}${url.search}`,
         method: init.method ?? 'GET',
         headers: headerObject,
+        // Disable the global agent pool so idle sockets keyed by hostname cannot
+        // bypass the pin lookup (DNS rebinding via keep-alive reuse).
+        agent: false,
         lookup: (_hostname, options, callback) => {
           const cb = callback as (
             err: Error | null,

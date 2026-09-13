@@ -401,6 +401,57 @@ describe('safeFetch redirect semantics', () => {
     }
   });
 
+  it('sets response.redirected after following a Location redirect', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (href.includes('/start')) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'https://1.0.0.1/final' },
+        });
+      }
+      return new Response('done', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const redirected = await safeFetch('https://1.1.1.1/start');
+      expect(redirected.redirected).toBe(true);
+      expect(redirected.status).toBe(200);
+
+      const direct = await safeFetch('https://1.1.1.1/direct');
+      expect(direct.redirected).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('applies referrer and referrerPolicy to the Referer header', async () => {
+    const original = globalThis.fetch;
+    let seenReferer: string | null = null;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenReferer = new Headers(init?.headers).get('referer');
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      await safeFetch('https://1.1.1.1/resource', {
+        referrer: 'https://example.com/page?q=1',
+        referrerPolicy: 'origin',
+      });
+      expect(seenReferer).toBe('https://example.com/');
+
+      seenReferer = null;
+      await safeFetch('https://1.1.1.1/resource', {
+        referrer: 'https://example.com/page?q=1',
+        referrerPolicy: 'no-referrer',
+      });
+      expect(seenReferer).toBeNull();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it('rejects CONNECT before any network attempt', async () => {
     const original = globalThis.fetch;
     const fetchMock = mock(() => {
