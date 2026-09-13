@@ -238,6 +238,46 @@ describe('Shell security (SEC-07)', () => {
       ).rejects.toThrow(/not allowlisted/);
     });
 
+    it('rejects same-length in-place replacement even when mtime is restored', async () => {
+      if (process.platform === 'win32') return;
+      const pinDir = path.join(tmpRoot, 'forge-mtime-pin');
+      fs.mkdirSync(pinDir, { recursive: true });
+      const toolPath = path.join(pinDir, 'mytool');
+      // Keep payloads identical length so size alone cannot detect the swap.
+      const original = '#!/bin/sh\necho original\n';
+      const forged = '#!/bin/sh\necho FORGED!!\n';
+      expect(Buffer.byteLength(original)).toBe(Buffer.byteLength(forged));
+      fs.writeFileSync(toolPath, original, { mode: 0o755 });
+      const pinnedStat = fs.statSync(toolPath);
+
+      const prevPath = process.env.PATH;
+      process.env.PATH = `${pinDir}${path.delimiter}${prevPath ?? ''}`;
+      let exec;
+      try {
+        exec = createShellExecTool({
+          allowedCommands: ['mytool'],
+          allowedCwdRoots: [tmpRoot],
+        });
+      } finally {
+        if (prevPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = prevPath;
+        }
+      }
+
+      const ok = await exec!.execute({ command: 'mytool', cwd: tmpRoot });
+      expect(ok.exitCode).toBe(0);
+      expect(ok.stdout.trim()).toBe('original');
+
+      // Forge: overwrite with same-length payload and restore mtime.
+      fs.writeFileSync(toolPath, forged, { mode: 0o755 });
+      fs.utimesSync(toolPath, pinnedStat.atime, pinnedStat.mtime);
+      await expect(
+        exec!.execute({ command: 'mytool', cwd: tmpRoot })
+      ).rejects.toThrow(/not allowlisted/);
+    });
+
     it('preserves symlink spawn path so argv[0] multicalls keep working', async () => {
       const multiDir = path.join(tmpRoot, 'multicall-bin');
       fs.mkdirSync(multiDir, { recursive: true });

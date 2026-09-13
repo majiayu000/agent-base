@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
@@ -38,6 +39,8 @@ export interface ShellSecurityPolicy {
 /**
  * Strong file identity captured at pin time so an in-place binary replacement
  * (same pathname / realpath) cannot satisfy the allowlist after resolve.
+ * Includes a content digest so same-length overwrites with restored mtime
+ * cannot forge the metadata-only identity.
  */
 export interface PinnedFileIdentity {
   /** Filesystem device id from `stat.dev`. */
@@ -48,6 +51,8 @@ export interface PinnedFileIdentity {
   size: number;
   /** Modification time in milliseconds from `stat.mtimeMs`. */
   mtimeMs: number;
+  /** SHA-256 hex digest of file contents (unforgeable without rewriting bytes). */
+  sha256: string;
 }
 
 /**
@@ -56,8 +61,8 @@ export interface PinnedFileIdentity {
  * Path-qualified entries bind both the authorized invocation basename (BusyBox
  * multicall applet name) and the canonical target. Bare names also capture the
  * trusted-PATH spawn path so later PATH changes cannot authorize a different binary.
- * Both forms also pin file identity (dev/ino/size/mtime) to reject in-place
- * replacements that preserve the pathname.
+ * Both forms also pin file identity (dev/ino/size/mtime + content SHA-256) to
+ * reject in-place replacements that preserve the pathname.
  */
 export interface AllowedCommandPin {
   /** Authorized invocation basename (e.g. `ls`, not `sh` on a shared BusyBox). */
@@ -139,11 +144,15 @@ export function captureFileIdentity(filePath: string): PinnedFileIdentity | unde
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return undefined;
+    const sha256 = createHash('sha256')
+      .update(fs.readFileSync(filePath))
+      .digest('hex');
     return {
       dev: stat.dev,
       ino: stat.ino,
       size: stat.size,
       mtimeMs: stat.mtimeMs,
+      sha256,
     };
   } catch {
     return undefined;
@@ -162,7 +171,8 @@ export function fileIdentityMatches(
     live.dev === expected.dev &&
     live.ino === expected.ino &&
     live.size === expected.size &&
-    live.mtimeMs === expected.mtimeMs
+    live.mtimeMs === expected.mtimeMs &&
+    live.sha256 === expected.sha256
   );
 }
 
