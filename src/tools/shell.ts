@@ -50,10 +50,25 @@ function installExitHook(): void {
   exitHookInstalled = true;
 
   // process.exit / normal exit: kill detached groups the parent would otherwise orphan.
-  // Signal handlers are left to the host (e.g. CLI) so test runners are not disrupted.
   process.on('exit', () => {
     killActiveShellChildren();
   });
+
+  // Default SIGINT/SIGTERM do not always reach detached POSIX process groups, and
+  // relying on `exit` alone is insufficient for library consumers that never
+  // install their own handlers (unlike src/cli.ts). Clean up on those signals;
+  // if we replaced the default handler (no prior listeners), restore exit.
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    const hadPriorListeners = process.listenerCount(signal) > 0;
+    process.on(signal, () => {
+      killActiveShellChildren();
+      if (!hadPriorListeners && process.listenerCount(signal) === 1) {
+        // We are the only listener — restore conventional default exit codes.
+        const code = signal === 'SIGINT' ? 130 : 143;
+        process.exit(code);
+      }
+    });
+  }
 }
 
 function hasExited(child: ChildProcess): boolean {

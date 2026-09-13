@@ -112,9 +112,34 @@ export const writeFileTool = defineTool<
 
     throwIfAborted(signal);
 
-    // Write file
+    // Write to a temporary sibling first, then rename. Abortable writeFile can
+    // truncate or partially overwrite the destination before rejecting; atomic
+    // replace preserves prior contents when cancellation wins.
     const buffer = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
-    await fs.writeFile(absolutePath, buffer, { signal });
+    const tmpPath = path.join(
+      path.dirname(absolutePath),
+      `.${path.basename(absolutePath)}.${process.pid}.${Date.now()}.tmp`
+    );
+
+    try {
+      await fs.writeFile(tmpPath, buffer, { signal });
+      throwIfAborted(signal);
+
+      try {
+        await fs.rename(tmpPath, absolutePath);
+      } catch (renameErr) {
+        // Windows cannot rename over an existing file — replace explicitly.
+        if (!created) {
+          await fs.unlink(absolutePath);
+          await fs.rename(tmpPath, absolutePath);
+        } else {
+          throw renameErr;
+        }
+      }
+    } catch (err) {
+      await fs.unlink(tmpPath).catch(() => {});
+      throw err;
+    }
 
     return {
       path: absolutePath,

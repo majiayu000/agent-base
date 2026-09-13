@@ -508,6 +508,33 @@ describe('filesystem abort', () => {
     expect(existsSync(target)).toBe(false);
   });
 
+  it('preserves existing file contents when write_file aborts after temp write', async () => {
+    const fsPromises = await import('fs/promises');
+    const target = join(tmpdir(), `agent-base-fs-atomic-${Date.now()}-${process.pid}.txt`);
+    writeFileSync(target, 'original-content');
+    const controller = new AbortController();
+
+    const realWriteFile = fsPromises.writeFile.bind(fsPromises);
+    const spy = vi.spyOn(fsPromises, 'writeFile').mockImplementation(async (path, data, options) => {
+      await realWriteFile(path, data as never);
+      // Simulate abort winning after the temp file was written but before rename.
+      controller.abort();
+    });
+
+    try {
+      await expectAbort(
+        writeFileTool.execute(
+          { path: target, content: 'new-content-should-not-land' },
+          controller.signal
+        )
+      );
+      expect(readFileSync(target, 'utf8')).toBe('original-content');
+    } finally {
+      spy.mockRestore();
+      unlinkSync(target);
+    }
+  });
+
   it('rejects list_directory when aborted between recursive entries', async () => {
     const controller = new AbortController();
     // Abort immediately so the first throwIfAborted in listDir fires.
@@ -966,6 +993,91 @@ describe('Agent abort path regressions', () => {
       const result = await agent.run('hello');
       expect(result.response).not.toBe('Agent run was aborted.');
       expect(result.maxIterationsReached).toBe(true);
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('does not treat bare AbortError as cancellation when the run signal is live', async () => {
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+    });
+
+    const createStream = vi
+      .spyOn(LLMClient.prototype, 'createStream')
+      .mockRejectedValue(createAbortError('sdk-internal cancel'));
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).not.toBe('Agent run was aborted.');
+      expect(result.maxIterationsReached).toBe(true);
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('pairs tool results when beforeToolCall middleware rejects after abort', async () => {
+    let agent!: Agent;
+    agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      middlewares: [
+        {
+          beforeToolCall: async () => {
+            agent.abort();
+            throw createAbortError('middleware rejected after abort');
+          },
+        },
+      ],
+    });
+
+    agent.registerTool(
+      defineTool({
+        name: 'echo',
+        description: 'echo',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => 'should-not-run',
+      })
+    );
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_mw_abort',
+                  function: { name: 'echo', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      const messages = agent.getMessages();
+      const toolMsgs = messages.filter((m) => m.role === 'tool');
+      expect(toolMsgs).toHaveLength(1);
+      expect(toolMsgs[0]?.tool_call_id).toBe('call_mw_abort');
     } finally {
       createStream.mockRestore();
     }

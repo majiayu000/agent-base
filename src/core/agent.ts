@@ -5,7 +5,7 @@ import type { AgentConfig, AgentEvents, AgentResult, LLMClientConfig, Message, T
 import { defaultConfig } from './types.js';
 import type { AgentMiddleware, MiddlewareContext } from '../utils/middleware.js';
 import { MiddlewareRunner } from '../utils/middleware.js';
-import { abortableDelay, isAbortError } from '../utils/abort.js';
+import { abortableDelay } from '../utils/abort.js';
 
 // ============================================================================
 // Agent Options
@@ -139,8 +139,9 @@ export class Agent {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        // Don't retry on abort
-        if (signal?.aborted || isAbortError(lastError)) {
+        // Don't retry on agent cancellation only — bare AbortError from an
+        // SDK-internal controller must not skip retries while the run signal lives.
+        if (signal?.aborted) {
           throw lastError;
         }
 
@@ -231,6 +232,9 @@ export class Agent {
       result.iterations = iteration + 1;
       mwCtx.iteration = iteration + 1;
 
+      // Tool calls that still need pairing if middleware rejects into the catch.
+      let unpairedToolCalls: NonNullable<Message['tool_calls']> | undefined;
+
       try {
         // Run beforeRequest middleware
         const messages = await this.middleware.runBeforeRequest(mwCtx, this.context.getMessages());
@@ -304,11 +308,14 @@ export class Agent {
           return result;
         }
 
+        unpairedToolCalls = parsed.toolCalls;
+
         // Abort during onIteration / afterResponse must skip beforeToolCall /
         // onToolCall side effects, while still pairing synthetic cancel results
         // so continue() does not send orphan assistant tool_calls.
         if (signal.aborted) {
           this.addCancelledToolResults(parsed.toolCalls, result);
+          unpairedToolCalls = undefined;
           result.response = 'Agent run was aborted.';
           return result;
         }
@@ -413,6 +420,7 @@ export class Agent {
             content: resultContent,
           });
         }
+        unpairedToolCalls = undefined;
 
         // ToolExecutor turns abort rejections into error results, so recheck
         // after tools settle — otherwise maxIterations can misreport abort.
@@ -423,8 +431,15 @@ export class Agent {
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
 
-        // Abort is terminal — do not treat as recoverable LLM error
-        if (signal.aborted || isAbortError(err)) {
+        // Abort is terminal only when the agent's own run signal fired.
+        // Bare AbortError from SDK-internal controllers must use normal error handling.
+        if (signal.aborted) {
+          // Middleware rejection after abort jumps here via Promise.all — pair
+          // outstanding tool_calls before returning so continue() stays valid.
+          if (unpairedToolCalls?.length) {
+            this.addCancelledToolResults(unpairedToolCalls, result);
+            unpairedToolCalls = undefined;
+          }
           result.response = 'Agent run was aborted.';
           return result;
         }
