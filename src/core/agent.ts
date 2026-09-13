@@ -289,6 +289,13 @@ export class Agent {
 
         const toolResults = await Promise.all(toolPromises);
 
+        // ToolExecutor turns abort rejections into error results, so recheck
+        // after tools settle — otherwise maxIterations can misreport abort.
+        if (signal.aborted) {
+          result.response = 'Agent run was aborted.';
+          return result;
+        }
+
         // Process results in order (maintain context order)
         for (const { toolCall, toolName, toolArgs, execResult } of toolResults) {
           // Truncate result if too long

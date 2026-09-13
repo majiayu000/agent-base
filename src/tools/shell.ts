@@ -91,12 +91,29 @@ function killChild(child: ChildProcess): void {
   // Always attempt SIGTERM against the tree/group first.
   killProcessTree(child, 'SIGTERM');
 
-  setTimeout(() => {
+  const escalationTimer = setTimeout(() => {
     // Escalate SIGKILL even if the group leader has exited — descendants that
     // ignore SIGTERM may still be running and holding pipes open.
     // killProcessTree itself no-ops only when the whole group is gone.
     killProcessTree(child, 'SIGKILL');
   }, KILL_ESCALATION_MS);
+
+  // Do not keep short-lived CLIs alive solely for the escalation interval.
+  escalationTimer.unref?.();
+
+  const clearEscalationIfTreeGone = () => {
+    if (child.pid == null || !processGroupExists(child.pid)) {
+      clearTimeout(escalationTimer);
+    }
+  };
+
+  // Cancel escalation once the leader exits and the process group is gone.
+  // If orphans remain after the leader exits, leave the (unref'd) timer armed.
+  if (hasExited(child)) {
+    clearEscalationIfTreeGone();
+  } else {
+    child.once('close', clearEscalationIfTreeGone);
+  }
 }
 
 function spawnCommand(

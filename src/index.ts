@@ -122,6 +122,7 @@ export {
   mergeAbortSignals,
   throwIfAborted,
 } from './utils/abort.js';
+export type { MergedAbortHandle } from './utils/abort.js';
 
 // Utilities - Token Tracker
 export {
@@ -266,6 +267,7 @@ export type {
   // Evaluation & Monitoring
   MetricValue,
   EvaluationCriteria,
+  MonitorEvaluationResult,
   MonitorConfig,
   MonitorStats,
   // Reasoning

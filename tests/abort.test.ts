@@ -64,9 +64,35 @@ describe('abort helpers', () => {
     const a = new AbortController();
     const b = new AbortController();
     const merged = mergeAbortSignals(a.signal, b.signal);
-    expect(merged.aborted).toBe(false);
+    expect(merged.signal.aborted).toBe(false);
     b.abort();
-    expect(merged.aborted).toBe(true);
+    expect(merged.signal.aborted).toBe(true);
+  });
+
+  it('mergeAbortSignals fallback dispose removes unused source listeners', () => {
+    const abortSignalAny = (
+      AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+    ).any;
+    const a = new AbortController();
+    const b = new AbortController();
+
+    // Force the manual fallback path even on runtimes that have AbortSignal.any.
+    (
+      AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+    ).any = undefined;
+
+    try {
+      const merged = mergeAbortSignals(a.signal, b.signal);
+      expect(merged.signal.aborted).toBe(false);
+      merged.dispose();
+      // After dispose, aborting sources must not affect the merged signal.
+      a.abort();
+      expect(merged.signal.aborted).toBe(false);
+    } finally {
+      (
+        AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+      ).any = abortSignalAny;
+    }
   });
 
   it('isAbortError detects AbortError name', () => {

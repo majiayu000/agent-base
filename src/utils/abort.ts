@@ -83,41 +83,72 @@ export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> 
 }
 
 /**
+ * Handle returned by {@link mergeAbortSignals}.
+ * Call `dispose()` when the merged operation finishes so fallback listeners
+ * attached to long-lived source signals are removed (noop under AbortSignal.any).
+ */
+export interface MergedAbortHandle {
+  signal: AbortSignal;
+  dispose: () => void;
+}
+
+/**
  * Merge multiple abort signals into one that aborts when any input aborts.
  * Prefer AbortSignal.any when available (Node 20+ / modern Bun).
+ *
+ * On runtimes without AbortSignal.any, listeners are attached to each source.
+ * Always call `dispose()` after the operation completes (success or failure)
+ * so unused listeners do not accumulate on long-lived signals.
  */
 export function mergeAbortSignals(
   ...signals: Array<AbortSignal | undefined | null>
-): AbortSignal {
+): MergedAbortHandle {
+  const noopDispose = () => {};
   const active = signals.filter((s): s is AbortSignal => s != null);
 
   if (active.length === 0) {
-    return new AbortController().signal;
+    return { signal: new AbortController().signal, dispose: noopDispose };
   }
   if (active.length === 1) {
-    return active[0];
+    return { signal: active[0], dispose: noopDispose };
   }
 
   const anyFn = (AbortSignal as typeof AbortSignal & {
     any?: (signals: AbortSignal[]) => AbortSignal;
   }).any;
   if (typeof anyFn === 'function') {
-    return anyFn.call(AbortSignal, active);
+    return { signal: anyFn.call(AbortSignal, active), dispose: noopDispose };
   }
 
   const controller = new AbortController();
+  let disposed = false;
+
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    for (const signal of active) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  };
+
   const onAbort = (event: Event) => {
     const target = event.target as AbortSignal;
-    controller.abort(target.reason);
+    // Detach from every source — `{ once: true }` only drops the firing one.
+    dispose();
+    if (!controller.signal.aborted) {
+      controller.abort(target.reason);
+    }
   };
 
   for (const signal of active) {
     if (signal.aborted) {
       controller.abort(signal.reason);
-      return controller.signal;
+      return { signal: controller.signal, dispose: noopDispose };
     }
-    signal.addEventListener('abort', onAbort, { once: true });
+    signal.addEventListener('abort', onAbort);
   }
 
-  return controller.signal;
+  return { signal: controller.signal, dispose };
 }

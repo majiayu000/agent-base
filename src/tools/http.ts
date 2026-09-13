@@ -46,7 +46,10 @@ export const httpGetTool = defineTool<
 
     const timeoutController = new AbortController();
     const timeoutId = setTimeout(() => timeoutController.abort(createAbortError('Request timed out')), timeout);
-    const requestSignal = mergeAbortSignals(timeoutController.signal, signal);
+    const { signal: requestSignal, dispose: disposeMerged } = mergeAbortSignals(
+      timeoutController.signal,
+      signal
+    );
 
     try {
       const response = await fetch(url, {
@@ -74,6 +77,7 @@ export const httpGetTool = defineTool<
       };
     } finally {
       clearTimeout(timeoutId);
+      disposeMerged();
     }
   },
 });
@@ -125,7 +129,10 @@ export const httpPostTool = defineTool<
 
     const timeoutController = new AbortController();
     const timeoutId = setTimeout(() => timeoutController.abort(createAbortError('Request timed out')), timeout);
-    const requestSignal = mergeAbortSignals(timeoutController.signal, signal);
+    const { signal: requestSignal, dispose: disposeMerged } = mergeAbortSignals(
+      timeoutController.signal,
+      signal
+    );
 
     let requestBody: string | undefined;
     const requestHeaders: Record<string, string> = {
@@ -178,6 +185,7 @@ export const httpPostTool = defineTool<
       };
     } finally {
       clearTimeout(timeoutId);
+      disposeMerged();
     }
   },
 });
