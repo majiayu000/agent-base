@@ -11,6 +11,7 @@ import { ToolExecutor, defineTool } from '../src/core/tool-executor.js';
 import type { ToolCall } from '../src/core/types.js';
 import { httpGetTool } from '../src/tools/http.js';
 import { shellExecTool, shellRunTool } from '../src/tools/shell.js';
+import { listDirectoryTool, writeFileTool } from '../src/tools/filesystem.js';
 import type { Stream } from 'openai/streaming';
 import type OpenAI from 'openai';
 import { existsSync, readFileSync, unlinkSync } from 'fs';
@@ -88,6 +89,50 @@ describe('abort helpers', () => {
       // After dispose, aborting sources must not affect the merged signal.
       a.abort();
       expect(merged.signal.aborted).toBe(false);
+    } finally {
+      (
+        AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+      ).any = abortSignalAny;
+    }
+  });
+
+  it('mergeAbortSignals fallback removes listeners attached before an already-aborted source', () => {
+    const abortSignalAny = (
+      AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+    ).any;
+    const a = new AbortController();
+    const b = new AbortController();
+    b.abort();
+
+    (
+      AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
+    ).any = undefined;
+
+    let attached = 0;
+    const origAdd = a.signal.addEventListener.bind(a.signal);
+    const origRemove = a.signal.removeEventListener.bind(a.signal);
+    a.signal.addEventListener = ((
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions
+    ) => {
+      if (type === 'abort') attached++;
+      return origAdd(type, listener, options);
+    }) as typeof a.signal.addEventListener;
+    a.signal.removeEventListener = ((
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions
+    ) => {
+      if (type === 'abort') attached--;
+      return origRemove(type, listener, options);
+    }) as typeof a.signal.removeEventListener;
+
+    try {
+      const merged = mergeAbortSignals(a.signal, b.signal);
+      expect(merged.signal.aborted).toBe(true);
+      // Early return must detach listeners already attached to the live source.
+      expect(attached).toBe(0);
     } finally {
       (
         AbortSignal as typeof AbortSignal & { any?: (signals: AbortSignal[]) => AbortSignal }
@@ -368,6 +413,33 @@ describe('http_get abort', () => {
     setTimeout(() => controller.abort(), 30);
     await expectAbort(pending);
   }, 10_000);
+});
+
+describe('filesystem abort', () => {
+  it('rejects write_file when signal is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const target = join(tmpdir(), `agent-base-fs-abort-${Date.now()}.txt`);
+    await expectAbort(
+      writeFileTool.execute(
+        { path: target, content: 'should-not-write' },
+        controller.signal
+      )
+    );
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it('rejects list_directory when aborted between recursive entries', async () => {
+    const controller = new AbortController();
+    // Abort immediately so the first throwIfAborted in listDir fires.
+    controller.abort();
+    await expectAbort(
+      listDirectoryTool.execute(
+        { path: process.cwd(), recursive: true },
+        controller.signal
+      )
+    );
+  });
 });
 
 describe('LLMClient createStream signal forwarding', () => {

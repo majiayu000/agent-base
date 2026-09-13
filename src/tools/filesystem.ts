@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
+import { throwIfAborted } from '../utils/abort.js';
 
 // ============================================================================
 // Filesystem Tools
@@ -30,7 +31,8 @@ export const readFileTool = defineTool<
     },
     required: ['path'],
   },
-  execute: async ({ path: filePath, encoding = 'utf-8' }) => {
+  execute: async ({ path: filePath, encoding = 'utf-8' }, signal) => {
+    throwIfAborted(signal);
     const absolutePath = path.resolve(filePath);
     const stats = await fs.stat(absolutePath);
 
@@ -44,7 +46,8 @@ export const readFileTool = defineTool<
       throw new Error(`File too large: ${stats.size} bytes (max: ${maxSize})`);
     }
 
-    const buffer = await fs.readFile(absolutePath);
+    throwIfAborted(signal);
+    const buffer = await fs.readFile(absolutePath, { signal });
     const content = encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf-8');
 
     return {
@@ -88,7 +91,8 @@ export const writeFileTool = defineTool<
     },
     required: ['path', 'content'],
   },
-  execute: async ({ path: filePath, content, encoding = 'utf-8', createDirs = true }) => {
+  execute: async ({ path: filePath, content, encoding = 'utf-8', createDirs = true }, signal) => {
+    throwIfAborted(signal);
     const absolutePath = path.resolve(filePath);
 
     // Check if file exists
@@ -99,14 +103,18 @@ export const writeFileTool = defineTool<
       created = true;
     }
 
+    throwIfAborted(signal);
+
     // Create parent directories if needed
     if (createDirs) {
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
     }
 
+    throwIfAborted(signal);
+
     // Write file
     const buffer = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
-    await fs.writeFile(absolutePath, buffer);
+    await fs.writeFile(absolutePath, buffer, { signal });
 
     return {
       path: absolutePath,
@@ -143,14 +151,17 @@ export const listDirectoryTool = defineTool<
     },
     required: ['path'],
   },
-  execute: async ({ path: dirPath, recursive = false, pattern }) => {
+  execute: async ({ path: dirPath, recursive = false, pattern }, signal) => {
+    throwIfAborted(signal);
     const absolutePath = path.resolve(dirPath);
     const entries: Array<{ name: string; type: 'file' | 'directory'; size?: number }> = [];
 
     async function listDir(currentPath: string, prefix = '') {
+      throwIfAborted(signal);
       const items = await fs.readdir(currentPath, { withFileTypes: true });
 
       for (const item of items) {
+        throwIfAborted(signal);
         const relativePath = prefix ? `${prefix}/${item.name}` : item.name;
 
         // Apply pattern filter if specified
@@ -162,6 +173,7 @@ export const listDirectoryTool = defineTool<
         }
 
         if (item.isFile()) {
+          throwIfAborted(signal);
           const stats = await fs.stat(path.join(currentPath, item.name));
           entries.push({
             name: relativePath,
@@ -217,7 +229,8 @@ export const fileInfoTool = defineTool<
     },
     required: ['path'],
   },
-  execute: async ({ path: filePath }) => {
+  execute: async ({ path: filePath }, signal) => {
+    throwIfAborted(signal);
     const absolutePath = path.resolve(filePath);
 
     try {
@@ -273,11 +286,14 @@ export const deleteTool = defineTool<
     },
     required: ['path'],
   },
-  execute: async ({ path: targetPath, recursive = false }) => {
+  execute: async ({ path: targetPath, recursive = false }, signal) => {
+    throwIfAborted(signal);
     const absolutePath = path.resolve(targetPath);
 
     try {
       const stats = await fs.stat(absolutePath);
+
+      throwIfAborted(signal);
 
       if (stats.isDirectory()) {
         await fs.rm(absolutePath, { recursive });

@@ -144,6 +144,9 @@ export function mergeAbortSignals(
 
   for (const signal of active) {
     if (signal.aborted) {
+      // Remove listeners already attached to earlier live sources before
+      // returning — otherwise dispose would be a noop and those listeners leak.
+      dispose();
       controller.abort(signal.reason);
       return { signal: controller.signal, dispose: noopDispose };
     }

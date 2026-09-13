@@ -252,6 +252,12 @@ export class Agent {
 
         // Check if we're done (no tool calls)
         if (!parsed.toolCalls || parsed.toolCalls.length === 0) {
+          // Abort may fire during onIteration / afterResponse with no tools —
+          // recheck before treating this as a successful completion.
+          if (signal.aborted) {
+            result.response = 'Agent run was aborted.';
+            return result;
+          }
           result.response = parsed.content;
           // Run onComplete middleware
           await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
@@ -289,14 +295,8 @@ export class Agent {
 
         const toolResults = await Promise.all(toolPromises);
 
-        // ToolExecutor turns abort rejections into error results, so recheck
-        // after tools settle — otherwise maxIterations can misreport abort.
-        if (signal.aborted) {
-          result.response = 'Agent run was aborted.';
-          return result;
-        }
-
-        // Process results in order (maintain context order)
+        // Always pair tool_calls with tool results before returning on abort so
+        // a later continue() does not send orphan assistant tool_calls.
         for (const { toolCall, toolName, toolArgs, execResult } of toolResults) {
           // Truncate result if too long
           let resultContent = execResult.error ? `Error: ${execResult.error}` : execResult.result;
@@ -318,6 +318,13 @@ export class Agent {
             tool_call_id: toolCall.id,
             content: resultContent,
           });
+        }
+
+        // ToolExecutor turns abort rejections into error results, so recheck
+        // after tools settle — otherwise maxIterations can misreport abort.
+        if (signal.aborted) {
+          result.response = 'Agent run was aborted.';
+          return result;
         }
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));

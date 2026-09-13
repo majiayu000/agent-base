@@ -217,8 +217,11 @@ export const shellExecTool = defineTool<
       signal?.addEventListener('abort', onAbort, { once: true });
 
       child.stdout?.on('data', (data) => {
+        if (killed) {
+          return;
+        }
         stdout += data.toString();
-        // Limit output size
+        // Limit output size — escalate kill only once on first overrun.
         if (stdout.length > 100000) {
           stdout = stdout.slice(0, 100000) + '\n...[truncated]';
           killed = true;
@@ -337,7 +340,11 @@ export const shellRunTool = defineTool<
       signal?.addEventListener('abort', onAbort, { once: true });
 
       child.stdout?.on('data', (data) => {
+        if (killed) {
+          return;
+        }
         stdout += data.toString();
+        // Limit output size — escalate kill only once on first overrun.
         if (stdout.length > 100000) {
           stdout = stdout.slice(0, 100000) + '\n...[truncated]';
           killed = true;
