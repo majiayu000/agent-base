@@ -84,6 +84,16 @@ describe('resolveWithinWorkspace', () => {
     expect(resolved).toBe(path.join(realWorkspace, 'subdir', 'new-file.txt'));
   });
 
+  it('rejects dangling in-workspace symlinks that point outside the root', async () => {
+    const outsideMissing = path.join(
+      os.tmpdir(),
+      `agent-base-dangling-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    await fs.symlink(outsideMissing, path.join(workspace, 'dangling-out'));
+
+    await expect(resolveWithinWorkspace('dangling-out')).rejects.toThrow(/escapes workspace/i);
+  });
+
   it('honors AGENT_BASE_WORKSPACE_ROOT when module config is cleared', async () => {
     setWorkspaceRoot(undefined);
     process.env.AGENT_BASE_WORKSPACE_ROOT = workspace;
@@ -175,6 +185,42 @@ describe('filesystem tools workspace guards', () => {
     expect(result.deleted).toBe(true);
     const info = await fileInfoTool.execute({ path: 'todelete.txt' });
     expect(info.exists).toBe(false);
+  });
+
+  it('write_file rejects dangling in-workspace symlink that points outside', async () => {
+    const outsideMissing = path.join(
+      os.tmpdir(),
+      `agent-base-write-dangling-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    await fs.symlink(outsideMissing, path.join(workspace, 'dangling-write'));
+
+    await expect(
+      writeFileTool.execute({ path: 'dangling-write', content: 'should-not-create' })
+    ).rejects.toThrow(/escapes workspace/i);
+
+    await expect(fs.access(outsideMissing)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('delete_path rejects absolute outside-workspace symlink to an in-workspace file', async () => {
+    const target = path.join(workspace, 'inside-target.txt');
+    await fs.writeFile(target, 'keep');
+
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-base-out-del-'));
+    const outsideLink = path.join(outsideDir, 'outside-link');
+    try {
+      await fs.symlink(target, outsideLink);
+
+      await expect(deleteTool.execute({ path: outsideLink })).rejects.toThrow(
+        /escapes workspace/i
+      );
+
+      // Outside symlink must remain; in-workspace target must remain.
+      const linkStat = await fs.lstat(outsideLink);
+      expect(linkStat.isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(target, 'utf-8')).toBe('keep');
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
   });
 
   it('delete_path unlinks an in-workspace symlink without deleting its target', async () => {

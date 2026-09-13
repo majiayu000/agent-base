@@ -118,6 +118,12 @@ export function isPathInsideRoot(candidate: string, root: string): boolean {
 /**
  * realpath the longest existing prefix of `absolutePath`, then re-join
  * any trailing segments that do not exist yet (needed for create/write).
+ *
+ * Dangling symlinks are special: POSIX `realpath` returns ENOENT when the
+ * final component exists as a symlink but its target does not. Treating that
+ * as a missing path would reconstruct a contained lexical path and let
+ * write_file follow the link outside the workspace. Resolve via lstat/readlink
+ * so the intended target participates in containment checks.
  */
 async function realpathExistingPrefix(absolutePath: string): Promise<string> {
   const segments: string[] = [];
@@ -132,6 +138,30 @@ async function realpathExistingPrefix(absolutePath: string): Promise<string> {
       if (code !== 'ENOENT') {
         throw error;
       }
+
+      // Dangling (or otherwise unresolvable) symlink: follow the link text
+      // instead of pretending the entry is missing.
+      try {
+        const lst = await fs.lstat(current);
+        if (lst.isSymbolicLink()) {
+          const linkTarget = await fs.readlink(current);
+          const resolvedTarget = path.resolve(path.dirname(current), linkTarget);
+          current =
+            segments.length === 0
+              ? resolvedTarget
+              : path.join(resolvedTarget, ...segments);
+          segments.length = 0;
+          continue;
+        }
+      } catch (lstatError) {
+        // Only continue parent-walk when the entry is also missing for lstat.
+        // Other lstat failures (EACCES, etc.) must surface.
+        const lstatCode = (lstatError as NodeJS.ErrnoException).code;
+        if (lstatCode !== 'ENOENT') {
+          throw lstatError;
+        }
+      }
+
       const parent = path.dirname(current);
       if (parent === current) {
         // Nothing on this volume exists — fall back to lexical path
@@ -140,6 +170,31 @@ async function realpathExistingPrefix(absolutePath: string): Promise<string> {
       segments.unshift(path.basename(current));
       current = parent;
     }
+  }
+}
+
+/**
+ * Ensure the directory entry named by `lexicalPath` itself lives under
+ * `root` (via the canonical parent), not merely that its realpath target does.
+ * Required before unlink/rm of the lexical entry so an absolute outside-workspace
+ * symlink to an in-workspace file cannot be deleted.
+ */
+export async function assertLexicalEntryContained(
+  lexicalPath: string,
+  root: string
+): Promise<void> {
+  const parent = path.dirname(lexicalPath);
+  const parentReal = await realpathExistingPrefix(parent);
+  if (!isPathInsideRoot(parentReal, root)) {
+    throw new Error(
+      `Path escapes workspace root (${root}): ${lexicalPath}`
+    );
+  }
+  const entryUnderParent = path.join(parentReal, path.basename(lexicalPath));
+  if (!isPathInsideRoot(entryUnderParent, root)) {
+    throw new Error(
+      `Path escapes workspace root (${root}): ${lexicalPath}`
+    );
   }
 }
 

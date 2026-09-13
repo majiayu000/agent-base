@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
 import {
+  assertLexicalEntryContained,
   assertNotSensitivePaths,
   resolveWorkspacePath,
   revalidateContained,
@@ -311,9 +312,12 @@ export const deleteTool = defineTool<
     assertNotSensitivePaths(targetPath, realPath);
     assertNotSensitivePaths(lexicalPath, realPath);
 
-    // Re-check containment, then operate on the lexical path so an in-workspace
-    // symlink is unlinked rather than deleting its target.
+    // Re-check target containment, then require the lexical entry itself to
+    // live under the workspace before mutating it. Otherwise an absolute
+    // outside-workspace symlink to an in-workspace file would pass the
+    // realpath check and still be unlinked outside the root.
     await revalidateContained(lexicalPath, root);
+    await assertLexicalEntryContained(lexicalPath, root);
 
     try {
       const stats = await fs.lstat(lexicalPath);
