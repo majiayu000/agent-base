@@ -148,6 +148,7 @@ export type {
   ShellResult,
   ShellSecurityPolicy,
   ResolvedShellSecurityPolicy,
+  AllowedCommandPin,
 } from './tools/shell.js';
 
 // All tools combined - import and re-export for convenience

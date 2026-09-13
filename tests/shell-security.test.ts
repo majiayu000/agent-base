@@ -163,7 +163,12 @@ describe('Shell security (SEC-07)', () => {
         allowedCommands: [linkPath],
         allowedCwdRoots: [tmpRoot],
       });
-      expect(pinned.allowedCommands).toEqual([fs.realpathSync(goodBin)]);
+      expect(pinned.allowedCommands).toEqual([
+        {
+          name: 'tool',
+          canonicalPath: fs.realpathSync(goodBin),
+        },
+      ]);
 
       const exec = createShellExecTool({
         allowedCommands: [linkPath],
@@ -224,6 +229,92 @@ describe('Shell security (SEC-07)', () => {
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe('applet-ok');
+    });
+
+    it('does not let a path allowlist authorize a sibling multicall symlink', async () => {
+      const multiDir = path.join(tmpRoot, 'multicall-sibling');
+      fs.mkdirSync(multiDir, { recursive: true });
+      const busyboxLike = path.join(multiDir, 'busybox-like');
+      fs.writeFileSync(
+        busyboxLike,
+        '#!/bin/sh\nbase=$(basename "$0")\necho "applet=$base"\n',
+        { mode: 0o755 }
+      );
+      const lsLink = path.join(multiDir, 'ls');
+      const shLink = path.join(multiDir, 'sh');
+      try {
+        fs.symlinkSync(busyboxLike, lsLink);
+        fs.symlinkSync(busyboxLike, shLink);
+      } catch {
+        return;
+      }
+
+      const exec = createShellExecTool({
+        allowedCommands: [lsLink],
+        allowedCwdRoots: [tmpRoot],
+      });
+      const ok = await exec.execute({
+        command: lsLink,
+        cwd: tmpRoot,
+      });
+      expect(ok.exitCode).toBe(0);
+      expect(ok.stdout.trim()).toBe('applet=ls');
+
+      // Same canonical target, different authorized basename → deny.
+      await expect(
+        exec.execute({
+          command: shLink,
+          cwd: tmpRoot,
+        })
+      ).rejects.toThrow(/not allowlisted/);
+    });
+
+    it('pins bare allowlist names at policy resolve against later PATH changes', async () => {
+      const goodDir = path.join(tmpRoot, 'bare-pin-good');
+      const evilDir = path.join(tmpRoot, 'bare-pin-evil');
+      fs.mkdirSync(goodDir, { recursive: true });
+      fs.mkdirSync(evilDir, { recursive: true });
+      const goodBin = path.join(goodDir, 'mytool');
+      const evilBin = path.join(evilDir, 'mytool');
+      fs.writeFileSync(goodBin, '#!/bin/sh\necho good-pin\n', { mode: 0o755 });
+      fs.writeFileSync(evilBin, '#!/bin/sh\necho evil-pin\n', { mode: 0o755 });
+
+      const prevPath = process.env.PATH;
+      process.env.PATH = `${goodDir}${path.delimiter}${prevPath ?? ''}`;
+      let exec;
+      try {
+        exec = createShellExecTool({
+          allowedCommands: ['mytool'],
+          allowedCwdRoots: [tmpRoot],
+        });
+        const pinned = resolveShellSecurityPolicy({
+          allowedCommands: ['mytool'],
+          allowedCwdRoots: [tmpRoot],
+        });
+        expect(pinned.allowedCommands[0]).toEqual({
+          name: 'mytool',
+          canonicalPath: fs.realpathSync(goodBin),
+          pinnedSpawnPath: path.resolve(goodBin),
+        });
+      } finally {
+        // Flip PATH so a naive re-lookup would pick evil first.
+        process.env.PATH = `${evilDir}${path.delimiter}${prevPath ?? ''}`;
+      }
+
+      try {
+        const result = await exec!.execute({
+          command: 'mytool',
+          cwd: tmpRoot,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout.trim()).toBe('good-pin');
+      } finally {
+        if (prevPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = prevPath;
+        }
+      }
     });
 
     it('runs relative allowlisted executable with explicit cwd', async () => {
@@ -412,6 +503,10 @@ describe('Shell security (SEC-07)', () => {
       expect(isSecretEnvKey('SECRET')).toBe(true);
       expect(isSecretEnvKey('AWS_SECRET_ACCESS_KEY')).toBe(true);
       expect(isSecretEnvKey('AWS_ACCESS_KEY_ID')).toBe(true);
+      expect(isSecretEnvKey('DOCKER_AUTH_CONFIG')).toBe(true);
+      expect(isSecretEnvKey('NPM_CONFIG__AUTH')).toBe(true);
+      expect(isSecretEnvKey('CI_JOB_JWT')).toBe(true);
+      expect(isSecretEnvKey('SSH_PRIVATE_KEY')).toBe(true);
       expect(isSecretEnvKey('PATH')).toBe(false);
       expect(isSecretEnvKey('HOME')).toBe(false);
     });
@@ -427,8 +522,10 @@ describe('Shell security (SEC-07)', () => {
     it('strips secret keys and dangerous hooks from child env', () => {
       const prev = process.env.TEST_HARNESS_API_KEY;
       const prevAws = process.env.AWS_SECRET_ACCESS_KEY;
+      const prevDocker = process.env.DOCKER_AUTH_CONFIG;
       process.env.TEST_HARNESS_API_KEY = 'super-secret';
       process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
+      process.env.DOCKER_AUTH_CONFIG = 'docker-auth';
       try {
         const env = buildChildEnv(
           {
@@ -437,6 +534,9 @@ describe('Shell security (SEC-07)', () => {
             API_KEY: 'unprefixed',
             TOKEN: 'bare-token',
             SECRET: 'bare-secret',
+            NPM_CONFIG__AUTH: 'npm-auth',
+            CI_JOB_JWT: 'ci-jwt',
+            SSH_PRIVATE_KEY: 'ssh-key',
             LD_PRELOAD: '/tmp/evil.so',
             NODE_OPTIONS: '--require /tmp/evil.js',
             PATH: '/tmp/attacker',
@@ -445,6 +545,10 @@ describe('Shell security (SEC-07)', () => {
         );
         expect(env.TEST_HARNESS_API_KEY).toBeUndefined();
         expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+        expect(env.DOCKER_AUTH_CONFIG).toBeUndefined();
+        expect(env.NPM_CONFIG__AUTH).toBeUndefined();
+        expect(env.CI_JOB_JWT).toBeUndefined();
+        expect(env.SSH_PRIVATE_KEY).toBeUndefined();
         expect(env.OTHER_TOKEN).toBeUndefined();
         expect(env.API_KEY).toBeUndefined();
         expect(env.TOKEN).toBeUndefined();
@@ -463,6 +567,11 @@ describe('Shell security (SEC-07)', () => {
           delete process.env.AWS_SECRET_ACCESS_KEY;
         } else {
           process.env.AWS_SECRET_ACCESS_KEY = prevAws;
+        }
+        if (prevDocker === undefined) {
+          delete process.env.DOCKER_AUTH_CONFIG;
+        } else {
+          process.env.DOCKER_AUTH_CONFIG = prevDocker;
         }
       }
     });

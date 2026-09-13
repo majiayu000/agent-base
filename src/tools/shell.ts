@@ -35,14 +35,34 @@ export interface ShellSecurityPolicy {
   scrubEnv?: boolean;
 }
 
+/**
+ * Allowlist entry pinned at policy resolve time.
+ *
+ * Path-qualified entries bind both the authorized invocation basename (BusyBox
+ * multicall applet name) and the canonical target. Bare names also capture the
+ * trusted-PATH spawn path so later PATH changes cannot authorize a different binary.
+ */
+export interface AllowedCommandPin {
+  /** Authorized invocation basename (e.g. `ls`, not `sh` on a shared BusyBox). */
+  name: string;
+  /** realpath-pinned binary target. */
+  canonicalPath: string;
+  /**
+   * Absolute PATH lookup path captured for bare-name entries.
+   * Absent for path-qualified pins (those authorize any runnable path whose
+   * basename + canonical target match).
+   */
+  pinnedSpawnPath?: string;
+}
+
 export interface ResolvedShellSecurityPolicy {
   allowShellRun: boolean;
   /**
-   * Allowlist captured at policy resolve time. Bare names are unchanged;
-   * path-qualified entries are realpath-pinned so later symlink retargeting
-   * cannot widen authorization. Do not re-realpath path entries on match.
+   * Allowlist captured at policy resolve time. Path-qualified entries are
+   * realpath-pinned with their authorized basename; bare names are resolved
+   * against the trusted PATH once. Do not re-resolve pins on match.
    */
-  allowedCommands: string[];
+  allowedCommands: AllowedCommandPin[];
   /**
    * Canonical (realpath-pinned) cwd roots captured at policy resolve time.
    * Do not re-resolve these on each invocation — that reopens TOCTOU if a root
@@ -54,10 +74,11 @@ export interface ResolvedShellSecurityPolicy {
 
 /**
  * Matches credential-like env keys: exact unprefixed names, common suffixes,
- * and mid-key SECRET / PASSWORD / ACCESS_KEY (e.g. AWS_SECRET_ACCESS_KEY).
+ * mid-key SECRET / PASSWORD / ACCESS_KEY, and auth/JWT/private-key forms
+ * (e.g. DOCKER_AUTH_CONFIG, CI_JOB_JWT, SSH_PRIVATE_KEY, NPM_CONFIG__AUTH).
  */
 const SECRET_ENV_KEY =
-  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET)|SECRET|PASSWORD|ACCESS_KEY/i;
+  /^(API_KEY|TOKEN|SECRET|PASSWORD)$|(_API_KEY|_TOKEN|_SECRET|_AUTH|_JWT)|SECRET|PASSWORD|ACCESS_KEY|PRIVATE_KEY|AUTH_CONFIG|(^|_)JWT(_|$)|CREDENTIAL/i;
 
 /** Env keys that can load/execute attacker-controlled code in child processes. */
 const DANGEROUS_ENV_KEYS = new Set(
@@ -92,17 +113,64 @@ const DANGEROUS_ENV_KEYS = new Set(
   ].map((k) => k.toUpperCase())
 );
 
+/**
+ * Pin a single allowlist entry against the trusted PATH / filesystem.
+ * Path entries bind basename + canonical target; bare names capture spawn path.
+ */
+export function pinAllowedCommand(
+  entry: string,
+  trustedPathEnv: string = process.env.PATH ?? ''
+): AllowedCommandPin {
+  if (commandHasPathSeparator(entry)) {
+    const absolute = path.resolve(entry);
+    return {
+      name: path.basename(absolute),
+      canonicalPath: tryRealpath(absolute),
+    };
+  }
+  const found = lookupExecutableOnTrustedPath(entry, trustedPathEnv);
+  if (!found) {
+    // Unresolvable at policy time: keep a never-matching pin (fail-closed).
+    return {
+      name: entry,
+      canonicalPath: '',
+      pinnedSpawnPath: '',
+    };
+  }
+  return {
+    name: entry,
+    canonicalPath: tryRealpath(found),
+    pinnedSpawnPath: found,
+  };
+}
+
+function isAllowedCommandPin(
+  value: string | AllowedCommandPin
+): value is AllowedCommandPin {
+  return typeof value === 'object' && value !== null && 'canonicalPath' in value;
+}
+
+/**
+ * Normalize raw string allowlists or already-pinned entries for matching.
+ */
+export function normalizeAllowedCommands(
+  allowedCommands: Array<string | AllowedCommandPin>,
+  trustedPathEnv: string = process.env.PATH ?? ''
+): AllowedCommandPin[] {
+  return allowedCommands.map((entry) =>
+    isAllowedCommandPin(entry) ? entry : pinAllowedCommand(entry, trustedPathEnv)
+  );
+}
+
 export function resolveShellSecurityPolicy(
   policy: ShellSecurityPolicy = {}
 ): ResolvedShellSecurityPolicy {
   const rawCommands = policy.allowedCommands ?? [];
   return {
     allowShellRun: policy.allowShellRun ?? false,
-    // Pin path-qualified allowlist entries at resolve time (same TOCTOU rationale
-    // as cwd roots). Bare names stay as configured.
-    allowedCommands: rawCommands.map((entry) =>
-      commandHasPathSeparator(entry) ? tryRealpath(path.resolve(entry)) : entry
-    ),
+    // Pin path-qualified entries (basename + canonical) and bare names (PATH
+    // spawn path) at resolve time so later symlink/PATH changes cannot widen auth.
+    allowedCommands: normalizeAllowedCommands(rawCommands, process.env.PATH ?? ''),
     // Only default when the property is omitted; explicit [] must remain fail-closed.
     // Pin each root via realpath at resolve time so later root retargeting cannot
     // widen the jail (TOCTOU).
@@ -248,40 +316,21 @@ export function lookupExecutableOnTrustedPath(
   return null;
 }
 
-function allowlistMatchesResolved(
-  allowedCommands: string[],
-  command: string,
-  canonicalPath: string
-): boolean {
-  const resolvedBase = path.basename(canonicalPath);
-  return allowedCommands.some((entry) => {
-    if (commandHasPathSeparator(entry)) {
-      // Path-qualified entries must already be pinned at policy resolve time.
-      // Re-realpathed matching would reopen TOCTOU if the entry symlink moves.
-      return entry === canonicalPath;
-    }
-    // Basename / exact-name allowlist entries never authorize path-qualified commands.
-    if (commandHasPathSeparator(command)) {
-      return false;
-    }
-    return entry === command || entry === resolvedBase || entry === path.basename(command);
-  });
-}
-
 /**
- * Resolve the executable that will be spawned using a trusted PATH, authorize it
- * against the allowlist using its canonical target, and return the invocation path
- * to pass to spawn (preserving argv[0] for symlink multicalls).
+ * Resolve the executable that will be spawned, authorize it against pinned
+ * allowlist identity (authorized basename + canonical target), and return the
+ * invocation path to pass to spawn (preserving argv[0] for symlink multicalls).
  *
  * Path-qualified commands (containing `/` or `\`) are resolved against `cwd`
  * (the validated shell working directory), not the Node process cwd.
  *
- * Path-qualified `allowedCommands` entries should already be realpath-pinned
- * (see resolveShellSecurityPolicy); matching does not re-resolve them.
+ * Bare-name pins use the spawn path captured at policy resolve time and do not
+ * re-lookup PATH. Path pins require both basename and canonical target to match
+ * so BusyBox-style multicall symlinks cannot authorize sibling applets.
  */
 export function resolveAllowedCommand(
   command: string,
-  allowedCommands: string[],
+  allowedCommands: Array<string | AllowedCommandPin>,
   trustedPathEnv: string = process.env.PATH ?? '',
   cwd: string = process.cwd()
 ): string {
@@ -299,7 +348,8 @@ export function resolveAllowedCommand(
     );
   }
 
-  let spawnPath: string;
+  const pins = normalizeAllowedCommands(allowedCommands, trustedPathEnv);
+
   if (commandHasPathSeparator(command)) {
     const absolute = path.resolve(cwd, command);
     // Require a directly runnable file; existing non-executables / directories
@@ -307,21 +357,40 @@ export function resolveAllowedCommand(
     if (!isRunnableFile(absolute)) {
       throw new Error(`shell_exec denied: command not found: ${command}`);
     }
-    spawnPath = absolute;
-  } else {
-    const found = lookupExecutableOnTrustedPath(command, trustedPathEnv);
-    if (!found) {
-      throw new Error(`shell_exec denied: command not found on trusted PATH: ${command}`);
+    const canonicalPath = tryRealpath(absolute);
+    const invName = path.basename(absolute);
+    // Path-qualified commands only match path-style pins (no pinnedSpawnPath).
+    // Basename-only / bare pins must not authorize path-qualified invocations.
+    const matched = pins.some(
+      (pin) =>
+        pin.pinnedSpawnPath === undefined &&
+        pin.canonicalPath === canonicalPath &&
+        pin.name === invName
+    );
+    if (!matched) {
+      throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
     }
-    spawnPath = found;
+    return absolute;
   }
 
-  const canonicalPath = tryRealpath(spawnPath);
-  if (!allowlistMatchesResolved(allowedCommands, command, canonicalPath)) {
+  // Bare name: use the PATH identity pinned at policy resolve — do not re-lookup.
+  const pin = pins.find(
+    (entry) => entry.pinnedSpawnPath !== undefined && entry.name === command
+  );
+  if (!pin || !pin.pinnedSpawnPath) {
     throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
   }
-
-  return spawnPath;
+  if (!isRunnableFile(pin.pinnedSpawnPath)) {
+    throw new Error(
+      `shell_exec denied: command not found on trusted PATH: ${command}`
+    );
+  }
+  const canonicalPath = tryRealpath(pin.pinnedSpawnPath);
+  if (canonicalPath !== pin.canonicalPath) {
+    // Symlink at the pinned spawn path was retargeted after policy resolve.
+    throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
+  }
+  return pin.pinnedSpawnPath;
 }
 
 /**
@@ -329,7 +398,7 @@ export function resolveAllowedCommand(
  */
 export function assertAllowedCommand(
   command: string,
-  allowedCommands: string[],
+  allowedCommands: Array<string | AllowedCommandPin>,
   cwd: string = process.cwd()
 ): void {
   resolveAllowedCommand(command, allowedCommands, process.env.PATH ?? '', cwd);
