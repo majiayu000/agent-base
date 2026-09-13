@@ -2,8 +2,9 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
 import {
-  assertNotSensitiveBasename,
-  resolveWithinWorkspace,
+  assertNotSensitivePaths,
+  resolveWorkspacePath,
+  revalidateContained,
 } from '../utils/path-safety.js';
 
 // ============================================================================
@@ -37,7 +38,8 @@ export const readFileTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: filePath, encoding = 'utf-8' }) => {
-    const absolutePath = await resolveWithinWorkspace(filePath);
+    const { root, lexicalPath } = await resolveWorkspacePath(filePath);
+    const absolutePath = await revalidateContained(lexicalPath, root);
     const stats = await fs.stat(absolutePath);
 
     if (!stats.isFile()) {
@@ -96,10 +98,14 @@ export const writeFileTool = defineTool<
     required: ['path', 'content'],
   },
   execute: async ({ path: filePath, content, encoding = 'utf-8', createDirs = true }) => {
-    const absolutePath = await resolveWithinWorkspace(filePath);
-    assertNotSensitiveBasename(absolutePath);
+    const { root, lexicalPath, realPath } = await resolveWorkspacePath(filePath);
+    // Check requested basename too — a `.env` symlink to a normal name must still be refused.
+    assertNotSensitivePaths(filePath, realPath);
+    assertNotSensitivePaths(lexicalPath, realPath);
 
-    // Check if file exists
+    const absolutePath = await revalidateContained(lexicalPath, root);
+
+    // Check if file exists (follow for existence; write uses verified real path)
     let created = false;
     try {
       await fs.access(absolutePath);
@@ -107,12 +113,12 @@ export const writeFileTool = defineTool<
       created = true;
     }
 
-    // Create parent directories if needed
+    // Create parent directories if needed (parent was validated via realpathExistingPrefix)
     if (createDirs) {
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
     }
 
-    // Write file
+    // Write file to the verified contained path
     const buffer = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
     await fs.writeFile(absolutePath, buffer);
 
@@ -153,7 +159,8 @@ export const listDirectoryTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: dirPath, recursive = false, pattern }) => {
-    const absolutePath = await resolveWithinWorkspace(dirPath);
+    const { root, lexicalPath } = await resolveWorkspacePath(dirPath);
+    const absolutePath = await revalidateContained(lexicalPath, root);
     const entries: Array<{ name: string; type: 'file' | 'directory'; size?: number }> = [];
 
     async function listDir(currentPath: string, prefix = '') {
@@ -228,9 +235,24 @@ export const fileInfoTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: filePath }) => {
-    const absolutePath = await resolveWithinWorkspace(filePath);
+    const { root, lexicalPath } = await resolveWorkspacePath(filePath);
+    const absolutePath = await revalidateContained(lexicalPath, root);
 
     try {
+      // Prefer lstat so callers can see symlink identity at the lexical path.
+      const lstats = await fs.lstat(lexicalPath);
+      if (lstats.isSymbolicLink()) {
+        return {
+          path: lexicalPath,
+          exists: true,
+          type: 'symlink',
+          size: lstats.size,
+          created: lstats.birthtime.toISOString(),
+          modified: lstats.mtime.toISOString(),
+          permissions: (lstats.mode & 0o777).toString(8),
+        };
+      }
+
       const stats = await fs.stat(absolutePath);
 
       let type: 'file' | 'directory' | 'symlink' | 'other';
@@ -269,7 +291,7 @@ export const deleteTool = defineTool<
 >({
   name: 'delete_path',
   description:
-    'Delete a file or directory within the workspace. Use recursive=true for non-empty directories. Paths outside the workspace and sensitive basenames (.env, *.pem, id_rsa) are rejected.',
+    'Delete a file or directory within the workspace. Use recursive=true for non-empty directories. Paths outside the workspace and sensitive basenames (.env, *.pem, id_rsa) are rejected. In-workspace symlinks are unlinked (the link is removed; the target is left intact).',
   parameters: {
     type: 'object',
     properties: {
@@ -285,22 +307,29 @@ export const deleteTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: targetPath, recursive = false }) => {
-    const absolutePath = await resolveWithinWorkspace(targetPath);
-    assertNotSensitiveBasename(absolutePath);
+    const { root, lexicalPath, realPath } = await resolveWorkspacePath(targetPath);
+    assertNotSensitivePaths(targetPath, realPath);
+    assertNotSensitivePaths(lexicalPath, realPath);
+
+    // Re-check containment, then operate on the lexical path so an in-workspace
+    // symlink is unlinked rather than deleting its target.
+    await revalidateContained(lexicalPath, root);
 
     try {
-      const stats = await fs.stat(absolutePath);
+      const stats = await fs.lstat(lexicalPath);
 
-      if (stats.isDirectory()) {
-        await fs.rm(absolutePath, { recursive });
+      if (stats.isSymbolicLink() || stats.isFile()) {
+        await fs.unlink(lexicalPath);
+      } else if (stats.isDirectory()) {
+        await fs.rm(lexicalPath, { recursive });
       } else {
-        await fs.unlink(absolutePath);
+        await fs.unlink(lexicalPath);
       }
 
-      return { path: absolutePath, deleted: true };
+      return { path: lexicalPath, deleted: true };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { path: absolutePath, deleted: false };
+        return { path: lexicalPath, deleted: false };
       }
       throw error;
     }

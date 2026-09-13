@@ -15,6 +15,23 @@ export interface ResolveWithinWorkspaceOptions {
   useRealpath?: boolean;
 }
 
+export interface WorkspacePath {
+  /** Realpath'd (when possible) workspace root used for containment. */
+  root: string;
+  /**
+   * Lexical absolute path under the root (`path.resolve(root, input)`).
+   * Does not follow the final symlink — use for unlink/rename of the
+   * caller-named entry itself.
+   */
+  lexicalPath: string;
+  /**
+   * Canonical path after realpath of the longest existing prefix.
+   * Use for containment checks and for I/O that should follow in-workspace
+   * symlinks to their target.
+   */
+  realPath: string;
+}
+
 /** Module-level workspace root override (constructor/config equivalent). */
 let configuredWorkspaceRoot: string | undefined;
 
@@ -71,6 +88,19 @@ export function assertNotSensitiveBasename(filePath: string): void {
 }
 
 /**
+ * Reject sensitive basenames on both the caller-requested path and the
+ * resolved target. Needed when `.env` is a symlink to a normal filename —
+ * realpath alone would hide the sensitive request basename.
+ */
+export function assertNotSensitivePaths(
+  requestedPath: string,
+  resolvedPath: string
+): void {
+  assertNotSensitiveBasename(requestedPath);
+  assertNotSensitiveBasename(resolvedPath);
+}
+
+/**
  * True if `candidate` is the workspace root or a path inside it.
  */
 export function isPathInsideRoot(candidate: string, root: string): boolean {
@@ -113,21 +143,10 @@ async function realpathExistingPrefix(absolutePath: string): Promise<string> {
   }
 }
 
-/**
- * Resolve `inputPath` against the workspace root and reject escapes.
- *
- * Absolute inputs and `../` segments are allowed only when the final
- * (optionally realpath'd) location remains under the workspace root.
- */
-export async function resolveWithinWorkspace(
-  inputPath: string,
-  options: ResolveWithinWorkspaceOptions = {}
+async function resolveRoot(
+  options: ResolveWithinWorkspaceOptions,
+  useRealpath: boolean
 ): Promise<string> {
-  if (typeof inputPath !== 'string' || inputPath.length === 0) {
-    throw new Error('Path must be a non-empty string');
-  }
-
-  const useRealpath = options.useRealpath !== false;
   let root = getWorkspaceRoot(options.workspaceRoot);
 
   if (useRealpath) {
@@ -142,18 +161,77 @@ export async function resolveWithinWorkspace(
     }
   }
 
+  return root;
+}
+
+/**
+ * Resolve `inputPath` against the workspace root and reject escapes.
+ * Returns both the lexical path (for symlink-preserving ops) and the
+ * realpath'd path (for containment / follow-target I/O).
+ */
+export async function resolveWorkspacePath(
+  inputPath: string,
+  options: ResolveWithinWorkspaceOptions = {}
+): Promise<WorkspacePath> {
+  if (typeof inputPath !== 'string' || inputPath.length === 0) {
+    throw new Error('Path must be a non-empty string');
+  }
+
+  const useRealpath = options.useRealpath !== false;
+  const root = await resolveRoot(options, useRealpath);
+
   // path.resolve ignores prior args once an absolute segment appears, so
   // absolute caller paths are checked as-is against the root.
-  const absolutePath = path.resolve(root, inputPath);
-  const candidate = useRealpath
-    ? await realpathExistingPrefix(absolutePath)
-    : absolutePath;
+  const lexicalPath = path.resolve(root, inputPath);
 
-  if (!isPathInsideRoot(candidate, root)) {
+  // Containment is decided on the realpath'd location. Do not require the
+  // lexical string to share the root prefix — on macOS `/var/...` and
+  // `/private/var/...` name the same directory, and absolute caller paths may
+  // use either form.
+  const realPath = useRealpath
+    ? await realpathExistingPrefix(lexicalPath)
+    : lexicalPath;
+
+  if (!isPathInsideRoot(realPath, root)) {
     throw new Error(
       `Path escapes workspace root (${root}): ${inputPath}`
     );
   }
 
-  return candidate;
+  return { root, lexicalPath, realPath };
+}
+
+/**
+ * Resolve `inputPath` against the workspace root and reject escapes.
+ *
+ * Absolute inputs and `../` segments are allowed only when the final
+ * (optionally realpath'd) location remains under the workspace root.
+ *
+ * Returns the canonical (realpath'd) path. Prefer {@link resolveWorkspacePath}
+ * when the lexical entry name must be preserved (e.g. unlink a symlink).
+ */
+export async function resolveWithinWorkspace(
+  inputPath: string,
+  options: ResolveWithinWorkspaceOptions = {}
+): Promise<string> {
+  const resolved = await resolveWorkspacePath(inputPath, options);
+  return resolved.realPath;
+}
+
+/**
+ * Re-validate that `lexicalPath` is still contained under `root`.
+ * Call immediately before filesystem access to shrink the check/use window
+ * (portable Node/Bun APIs do not expose openat for full descriptor binding).
+ */
+export async function revalidateContained(
+  lexicalPath: string,
+  root: string
+): Promise<string> {
+  const realPath = await realpathExistingPrefix(lexicalPath);
+  if (!isPathInsideRoot(realPath, root)) {
+    throw new Error(
+      `Path escapes workspace root (${root}): ${lexicalPath}`
+    );
+  }
+  return realPath;
 }

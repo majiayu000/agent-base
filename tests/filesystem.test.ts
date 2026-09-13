@@ -176,4 +176,39 @@ describe('filesystem tools workspace guards', () => {
     const info = await fileInfoTool.execute({ path: 'todelete.txt' });
     expect(info.exists).toBe(false);
   });
+
+  it('delete_path unlinks an in-workspace symlink without deleting its target', async () => {
+    const target = path.join(workspace, 'keep-me.txt');
+    await fs.writeFile(target, 'preserve');
+    await fs.symlink(target, path.join(workspace, 'link-to-keep.txt'));
+
+    const result = await deleteTool.execute({ path: 'link-to-keep.txt' });
+    expect(result.deleted).toBe(true);
+
+    await expect(fs.lstat(path.join(workspace, 'link-to-keep.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(await fs.readFile(target, 'utf-8')).toBe('preserve');
+  });
+
+  it('write_file rejects .env even when it is a symlink to a normal basename', async () => {
+    const target = path.join(workspace, 'innocent.txt');
+    await fs.writeFile(target, 'before');
+    await fs.symlink(target, path.join(workspace, '.env'));
+
+    await expect(
+      writeFileTool.execute({ path: '.env', content: 'exfiltrated' })
+    ).rejects.toThrow(/sensitive/i);
+
+    expect(await fs.readFile(target, 'utf-8')).toBe('before');
+  });
+
+  it('delete_path rejects .env even when it is a symlink to a normal basename', async () => {
+    const target = path.join(workspace, 'innocent-del.txt');
+    await fs.writeFile(target, 'before');
+    await fs.symlink(target, path.join(workspace, '.env'));
+
+    await expect(deleteTool.execute({ path: '.env' })).rejects.toThrow(/sensitive/i);
+    expect(await fs.readFile(target, 'utf-8')).toBe('before');
+  });
 });
