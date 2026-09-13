@@ -37,6 +37,11 @@ export interface ShellSecurityPolicy {
 
 export interface ResolvedShellSecurityPolicy {
   allowShellRun: boolean;
+  /**
+   * Allowlist captured at policy resolve time. Bare names are unchanged;
+   * path-qualified entries are realpath-pinned so later symlink retargeting
+   * cannot widen authorization. Do not re-realpath path entries on match.
+   */
   allowedCommands: string[];
   /**
    * Canonical (realpath-pinned) cwd roots captured at policy resolve time.
@@ -90,9 +95,14 @@ const DANGEROUS_ENV_KEYS = new Set(
 export function resolveShellSecurityPolicy(
   policy: ShellSecurityPolicy = {}
 ): ResolvedShellSecurityPolicy {
+  const rawCommands = policy.allowedCommands ?? [];
   return {
     allowShellRun: policy.allowShellRun ?? false,
-    allowedCommands: policy.allowedCommands ?? [],
+    // Pin path-qualified allowlist entries at resolve time (same TOCTOU rationale
+    // as cwd roots). Bare names stay as configured.
+    allowedCommands: rawCommands.map((entry) =>
+      commandHasPathSeparator(entry) ? tryRealpath(path.resolve(entry)) : entry
+    ),
     // Only default when the property is omitted; explicit [] must remain fail-closed.
     // Pin each root via realpath at resolve time so later root retargeting cannot
     // widen the jail (TOCTOU).
@@ -214,6 +224,8 @@ export function isRunnableFile(filePath: string): boolean {
 
 /**
  * Resolve a bare command name using the parent process PATH (never the caller overlay).
+ * Returns the PATH lookup path (not realpath) so symlink-backed multicall binaries
+ * (BusyBox-style) keep the requested name as argv[0] when spawned.
  */
 export function lookupExecutableOnTrustedPath(
   name: string,
@@ -229,7 +241,7 @@ export function lookupExecutableOnTrustedPath(
     for (const ext of extensions) {
       const candidate = path.join(dir, name + ext);
       if (isRunnableFile(candidate)) {
-        return tryRealpath(candidate);
+        return path.resolve(candidate);
       }
     }
   }
@@ -239,12 +251,14 @@ export function lookupExecutableOnTrustedPath(
 function allowlistMatchesResolved(
   allowedCommands: string[],
   command: string,
-  resolvedPath: string
+  canonicalPath: string
 ): boolean {
-  const resolvedBase = path.basename(resolvedPath);
+  const resolvedBase = path.basename(canonicalPath);
   return allowedCommands.some((entry) => {
     if (commandHasPathSeparator(entry)) {
-      return tryRealpath(entry) === resolvedPath || path.resolve(entry) === resolvedPath;
+      // Path-qualified entries must already be pinned at policy resolve time.
+      // Re-realpathed matching would reopen TOCTOU if the entry symlink moves.
+      return entry === canonicalPath;
     }
     // Basename / exact-name allowlist entries never authorize path-qualified commands.
     if (commandHasPathSeparator(command)) {
@@ -255,11 +269,15 @@ function allowlistMatchesResolved(
 }
 
 /**
- * Resolve the executable that will be spawned using a trusted PATH, canonicalize it,
- * and require it to match the allowlist. Returns the absolute path to pass to spawn.
+ * Resolve the executable that will be spawned using a trusted PATH, authorize it
+ * against the allowlist using its canonical target, and return the invocation path
+ * to pass to spawn (preserving argv[0] for symlink multicalls).
  *
  * Path-qualified commands (containing `/` or `\`) are resolved against `cwd`
  * (the validated shell working directory), not the Node process cwd.
+ *
+ * Path-qualified `allowedCommands` entries should already be realpath-pinned
+ * (see resolveShellSecurityPolicy); matching does not re-resolve them.
  */
 export function resolveAllowedCommand(
   command: string,
@@ -281,7 +299,7 @@ export function resolveAllowedCommand(
     );
   }
 
-  let resolvedPath: string | null;
+  let spawnPath: string;
   if (commandHasPathSeparator(command)) {
     const absolute = path.resolve(cwd, command);
     // Require a directly runnable file; existing non-executables / directories
@@ -289,19 +307,21 @@ export function resolveAllowedCommand(
     if (!isRunnableFile(absolute)) {
       throw new Error(`shell_exec denied: command not found: ${command}`);
     }
-    resolvedPath = tryRealpath(absolute);
+    spawnPath = absolute;
   } else {
-    resolvedPath = lookupExecutableOnTrustedPath(command, trustedPathEnv);
-    if (!resolvedPath) {
+    const found = lookupExecutableOnTrustedPath(command, trustedPathEnv);
+    if (!found) {
       throw new Error(`shell_exec denied: command not found on trusted PATH: ${command}`);
     }
+    spawnPath = found;
   }
 
-  if (!allowlistMatchesResolved(allowedCommands, command, resolvedPath)) {
+  const canonicalPath = tryRealpath(spawnPath);
+  if (!allowlistMatchesResolved(allowedCommands, command, canonicalPath)) {
     throw new Error(`shell_exec denied: command not allowlisted: ${command}`);
   }
 
-  return resolvedPath;
+  return spawnPath;
 }
 
 /**

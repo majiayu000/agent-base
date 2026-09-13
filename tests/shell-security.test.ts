@@ -128,14 +128,102 @@ describe('Shell security (SEC-07)', () => {
       const toolPath = path.join(binDir, 'tool');
       fs.writeFileSync(toolPath, '#!/bin/sh\necho from-cwd\n', { mode: 0o755 });
       const realTool = fs.realpathSync(toolPath);
+      const relativeCmd = path.join('.', 'bin', 'tool');
 
       const resolved = resolveAllowedCommand(
-        path.join('.', 'bin', 'tool'),
+        relativeCmd,
         [realTool],
         process.env.PATH ?? '',
         tmpRoot
       );
-      expect(resolved).toBe(realTool);
+      // Spawn path preserves the cwd-resolved invocation path (not realpath).
+      expect(resolved).toBe(path.resolve(tmpRoot, relativeCmd));
+      expect(fs.realpathSync(resolved)).toBe(realTool);
+    });
+
+    it('pins path-qualified allowlist entries at policy resolve against retargeting', async () => {
+      const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-'));
+      const goodDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-good-'));
+      const evilDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-allow-evil-'));
+      const goodBin = path.join(goodDir, 'tool');
+      const evilBin = path.join(evilDir, 'tool');
+      fs.writeFileSync(goodBin, '#!/bin/sh\necho good\n', { mode: 0o755 });
+      fs.writeFileSync(evilBin, '#!/bin/sh\necho evil\n', { mode: 0o755 });
+      const linkPath = path.join(linkDir, 'tool');
+      try {
+        fs.symlinkSync(goodBin, linkPath);
+      } catch {
+        fs.rmSync(linkDir, { recursive: true, force: true });
+        fs.rmSync(goodDir, { recursive: true, force: true });
+        fs.rmSync(evilDir, { recursive: true, force: true });
+        return;
+      }
+
+      const pinned = resolveShellSecurityPolicy({
+        allowedCommands: [linkPath],
+        allowedCwdRoots: [tmpRoot],
+      });
+      expect(pinned.allowedCommands).toEqual([fs.realpathSync(goodBin)]);
+
+      const exec = createShellExecTool({
+        allowedCommands: [linkPath],
+        allowedCwdRoots: [tmpRoot],
+      });
+      const ok = await exec.execute({
+        command: goodBin,
+        cwd: tmpRoot,
+      });
+      expect(ok.exitCode).toBe(0);
+      expect(ok.stdout.trim()).toBe('good');
+
+      fs.unlinkSync(linkPath);
+      fs.symlinkSync(evilBin, linkPath);
+
+      // Retargeted allowlist symlink must not authorize the new target.
+      await expect(
+        exec.execute({
+          command: evilBin,
+          cwd: tmpRoot,
+        })
+      ).rejects.toThrow(/not allowlisted/);
+
+      fs.rmSync(linkDir, { recursive: true, force: true });
+      fs.rmSync(goodDir, { recursive: true, force: true });
+      fs.rmSync(evilDir, { recursive: true, force: true });
+    });
+
+    it('preserves symlink spawn path so argv[0] multicalls keep working', async () => {
+      const multiDir = path.join(tmpRoot, 'multicall-bin');
+      fs.mkdirSync(multiDir, { recursive: true });
+      const busyboxLike = path.join(multiDir, 'busybox-like');
+      // Mimic BusyBox: dispatch on argv[0] basename.
+      fs.writeFileSync(
+        busyboxLike,
+        '#!/bin/sh\nbase=$(basename "$0")\nif [ "$base" = "applet" ]; then echo applet-ok; exit 0; fi\necho "bad argv0=$base"; exit 1\n',
+        { mode: 0o755 }
+      );
+      const appletLink = path.join(multiDir, 'applet');
+      try {
+        fs.symlinkSync(busyboxLike, appletLink);
+      } catch {
+        return;
+      }
+
+      // PATH lookup must return the symlink path, not the canonical multicall target.
+      const fromPath = resolveAllowedCommand('applet', ['applet'], multiDir);
+      expect(fromPath).toBe(path.resolve(appletLink));
+      expect(fs.realpathSync(fromPath)).toBe(fs.realpathSync(busyboxLike));
+
+      const exec = createShellExecTool({
+        allowedCommands: [appletLink],
+        allowedCwdRoots: [tmpRoot],
+      });
+      const result = await exec.execute({
+        command: appletLink,
+        cwd: tmpRoot,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('applet-ok');
     });
 
     it('runs relative allowlisted executable with explicit cwd', async () => {
@@ -421,7 +509,9 @@ describe('Shell security (SEC-07)', () => {
       fs.writeFileSync(runnable, '#!/bin/sh\necho ok\n', { mode: 0o755 });
 
       const resolved = resolveAllowedCommand('mytool', ['mytool'], `${firstDir}${path.delimiter}${secondDir}`);
-      expect(resolved).toBe(fs.realpathSync(runnable));
+      // Return the PATH hit path (not realpath) so symlink argv[0] is preserved.
+      expect(resolved).toBe(path.resolve(runnable));
+      expect(fs.realpathSync(resolved)).toBe(fs.realpathSync(runnable));
     });
 
     it('rejects path-qualified non-executable files and directories', () => {
