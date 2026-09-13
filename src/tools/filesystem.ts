@@ -238,15 +238,20 @@ export const fileInfoTool = defineTool<
     required: ['path'],
   },
   execute: async ({ path: filePath }) => {
-    const { root, lexicalPath } = await resolveWorkspacePath(filePath);
-    const absolutePath = await revalidateContained(lexicalPath, root);
+    // Soft-resolve so contained symlink entries can be inspected even when
+    // their targets escape the workspace or form a cycle. Target containment
+    // is required only when following a non-symlink entry.
+    const { root, lexicalPath, realPath } =
+      await resolveWorkspacePathAllowingTargetEscape(filePath);
     // Require the lexical entry itself to live under the workspace before
     // lstat — otherwise an absolute outside-workspace symlink to an
-    // in-workspace target would leak outside-path metadata.
+    // in-workspace target would leak outside-path metadata. The workspace
+    // root itself is allowed (assertLexicalEntryContained special-cases it).
     await assertLexicalEntryContained(lexicalPath, root);
 
     try {
-      // Prefer lstat so callers can see symlink identity at the lexical path.
+      // Prefer lstat so callers can see symlink identity at the lexical path
+      // without following outside/cyclic targets.
       const lstats = await fs.lstat(lexicalPath);
       if (lstats.isSymbolicLink()) {
         return {
@@ -260,6 +265,10 @@ export const fileInfoTool = defineTool<
         };
       }
 
+      if (!isPathInsideRoot(realPath, root)) {
+        throw new Error(`Path escapes workspace root (${root}): ${filePath}`);
+      }
+      const absolutePath = await revalidateContained(lexicalPath, root);
       const stats = await fs.stat(absolutePath);
 
       let type: 'file' | 'directory' | 'symlink' | 'other';
@@ -280,7 +289,7 @@ export const fileInfoTool = defineTool<
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return {
-          path: absolutePath,
+          path: lexicalPath,
           exists: false,
         };
       }

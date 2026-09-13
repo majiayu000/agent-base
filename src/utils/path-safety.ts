@@ -199,6 +199,12 @@ export async function assertLexicalEntryContained(
   lexicalPath: string,
   root: string
 ): Promise<void> {
+  // The workspace root itself is a valid contained entry; its parent lives
+  // outside the root by definition, so skip the parent check for that case.
+  if (path.resolve(lexicalPath) === path.resolve(root)) {
+    return;
+  }
+
   const parent = path.dirname(lexicalPath);
   const parentReal = await realpathExistingPrefix(parent);
   if (!isPathInsideRoot(parentReal, root)) {
@@ -292,9 +298,21 @@ export async function resolveWorkspacePathAllowingTargetEscape(
   const useRealpath = options.useRealpath !== false;
   const root = await resolveRoot(options, useRealpath);
   const lexicalPath = path.resolve(root, inputPath);
-  const realPath = useRealpath
-    ? await realpathExistingPrefix(lexicalPath)
-    : lexicalPath;
+
+  let realPath = lexicalPath;
+  if (useRealpath) {
+    try {
+      realPath = await realpathExistingPrefix(lexicalPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Cyclic symlinks raise ELOOP while following targets. Callers that
+      // only need the contained lexical entry (inspect/unlink the link)
+      // can still proceed with lexicalPath.
+      if (code !== 'ELOOP') {
+        throw error;
+      }
+    }
+  }
 
   return { root, lexicalPath, realPath };
 }

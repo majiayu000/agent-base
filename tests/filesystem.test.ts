@@ -196,6 +196,44 @@ describe('filesystem tools workspace guards', () => {
     expect(result.entries.some((e) => e.name === 'readme.txt')).toBe(true);
   });
 
+  it('file_info inspects the workspace root', async () => {
+    const result = await fileInfoTool.execute({ path: '.' });
+    expect(result.exists).toBe(true);
+    expect(result.type).toBe('directory');
+    expect(result.path).toBe(realWorkspace);
+  });
+
+  it('file_info reports in-workspace symlink metadata without requiring target containment', async () => {
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-base-out-info-target-'));
+    try {
+      await fs.writeFile(path.join(outsideDir, 'secret.txt'), 'secret');
+      await fs.symlink(path.join(outsideDir, 'secret.txt'), path.join(workspace, 'out-link'));
+
+      const info = await fileInfoTool.execute({ path: 'out-link' });
+      expect(info.exists).toBe(true);
+      expect(info.type).toBe('symlink');
+      expect(info.path).toBe(path.join(realWorkspace, 'out-link'));
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('file_info reports cyclic in-workspace symlink metadata', async () => {
+    await fs.symlink('loop', path.join(workspace, 'loop'));
+    const info = await fileInfoTool.execute({ path: 'loop' });
+    expect(info.exists).toBe(true);
+    expect(info.type).toBe('symlink');
+  });
+
+  it('delete_path unlinks a cyclic in-workspace symlink', async () => {
+    await fs.symlink('loop', path.join(workspace, 'loop'));
+    const result = await deleteTool.execute({ path: 'loop' });
+    expect(result.deleted).toBe(true);
+    await expect(fs.lstat(path.join(workspace, 'loop'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
   it('delete_path rejects escapes and sensitive basenames', async () => {
     await expect(deleteTool.execute({ path: '../readme.txt' })).rejects.toThrow(
       /escapes workspace/i
