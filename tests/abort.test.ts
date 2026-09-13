@@ -235,6 +235,49 @@ describe('parseStream abort', () => {
     await expectAbort(pending);
     expect(aborted).toBe(true);
   });
+
+  it('stops processing later fields in the same chunk after onThinking aborts', async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    let onTokenCount = 0;
+    const streamController = {
+      abort: () => {
+        aborted = true;
+      },
+    };
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              thinking: 'plan',
+              content: 'should-not-reach',
+            } as OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta,
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const stream = Object.assign(chunks(), { controller: streamController }) as unknown as Stream<
+      OpenAI.Chat.Completions.ChatCompletionChunk
+    >;
+
+    const pending = parseStream(stream, {
+      signal: controller.signal,
+      onThinking: () => {
+        controller.abort();
+      },
+      onToken: () => {
+        onTokenCount += 1;
+      },
+    });
+
+    await expectAbort(pending);
+    expect(aborted).toBe(true);
+    expect(onTokenCount).toBe(0);
+  });
 });
 
 describe('ToolExecutor abort', () => {
@@ -529,6 +572,51 @@ describe('filesystem abort', () => {
         )
       );
       expect(readFileSync(target, 'utf8')).toBe('original-content');
+    } finally {
+      spy.mockRestore();
+      unlinkSync(target);
+    }
+  });
+
+  it('preserves existing file mode when write_file replaces a file', async () => {
+    const { statSync } = await import('fs');
+    const target = join(tmpdir(), `agent-base-fs-mode-${Date.now()}-${process.pid}.sh`);
+    writeFileSync(target, '#!/bin/sh\necho hi\n', { mode: 0o755 });
+    const beforeMode = statSync(target).mode & 0o777;
+
+    try {
+      await writeFileTool.execute({ path: target, content: '#!/bin/sh\necho replaced\n' });
+      const afterMode = statSync(target).mode & 0o777;
+      expect(afterMode).toBe(beforeMode);
+      expect(readFileSync(target, 'utf8')).toContain('replaced');
+    } finally {
+      unlinkSync(target);
+    }
+  });
+
+  it('keeps the destination until Windows-style replace commits', async () => {
+    const fsPromises = await import('fs/promises');
+    const target = join(tmpdir(), `agent-base-fs-winreplace-${Date.now()}-${process.pid}.txt`);
+    writeFileSync(target, 'original-content');
+
+    const realRename = fsPromises.rename.bind(fsPromises);
+    let renameAttempts = 0;
+    const spy = vi.spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      renameAttempts += 1;
+      // First rename(tmp → dest) fails as on Windows when dest exists.
+      if (renameAttempts === 1) {
+        const err = new Error('EPERM') as NodeJS.ErrnoException;
+        err.code = 'EPERM';
+        throw err;
+      }
+      return realRename(from, to);
+    });
+
+    try {
+      await writeFileTool.execute({ path: target, content: 'replacement-content' });
+      expect(readFileSync(target, 'utf8')).toBe('replacement-content');
+      // Move-aside + commit + optional bak cleanup ⇒ at least 2 renames, never unlink-first.
+      expect(renameAttempts).toBeGreaterThanOrEqual(2);
     } finally {
       spy.mockRestore();
       unlinkSync(target);
@@ -1117,6 +1205,154 @@ describe('Agent abort path regressions', () => {
     try {
       const result = await agent.run('hello');
       expect(result.response).toBe('Agent run was aborted.');
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('pairs tool_calls when onError aborts after a tool-bearing assistant message', async () => {
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      events: {
+        onError: () => {
+          agent.abort();
+        },
+      },
+      middlewares: [
+        {
+          afterResponse: async () => {
+            throw new Error('afterResponse boom');
+          },
+        },
+      ],
+    });
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_onerror_pair',
+                  function: { name: 'echo', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.error).toMatch(/aborted/i);
+
+      const toolMessages = agent.getMessages().filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(1);
+      expect(toolMessages[0]?.tool_call_id).toBe('call_onerror_pair');
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('retains completed sibling tool results when another rejects after abort', async () => {
+    let agent!: Agent;
+    agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      middlewares: [
+        {
+          afterToolCall: async (_ctx, execResult) => {
+            if (execResult.toolName === 'slow') {
+              agent.abort();
+              throw new Error('canceled sibling middleware');
+            }
+            return execResult;
+          },
+        },
+      ],
+    });
+
+    agent.registerTool(
+      defineTool({
+        name: 'fast',
+        description: 'fast',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => 'fast-ok',
+      })
+    );
+    agent.registerTool(
+      defineTool({
+        name: 'slow',
+        description: 'slow',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => {
+          await new Promise((r) => setTimeout(r, 20));
+          return 'slow-ok';
+        },
+      })
+    );
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_fast',
+                  function: { name: 'fast', arguments: '{}' },
+                },
+                {
+                  index: 1,
+                  id: 'call_slow',
+                  function: { name: 'slow', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(result.toolCalls).toHaveLength(2);
+      expect(result.toolCalls.find((t) => t.name === 'fast')?.result).toBe('fast-ok');
+      expect(result.toolCalls.find((t) => t.name === 'slow')?.error).toMatch(/aborted|canceled/i);
+
+      const toolMessages = agent.getMessages().filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(2);
+      expect(toolMessages.map((m) => m.tool_call_id).sort()).toEqual(['call_fast', 'call_slow']);
     } finally {
       createStream.mockRestore();
     }

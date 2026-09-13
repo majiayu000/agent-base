@@ -280,6 +280,12 @@ export class Agent {
         // Add to context
         this.context.add(assistantMessage);
 
+        // Track pairing needs before onIteration / afterResponse — those
+        // callbacks can abort or throw and jump to the catch before tools run.
+        if (parsed.toolCalls.length > 0) {
+          unpairedToolCalls = parsed.toolCalls;
+        }
+
         // Notify iteration complete
         this.events.onIteration?.(iteration + 1, assistantMessage);
 
@@ -308,8 +314,6 @@ export class Agent {
           return result;
         }
 
-        unpairedToolCalls = parsed.toolCalls;
-
         // Abort during onIteration / afterResponse must skip beforeToolCall /
         // onToolCall side effects, while still pairing synthetic cancel results
         // so continue() does not send orphan assistant tool_calls.
@@ -320,81 +324,134 @@ export class Agent {
           return result;
         }
 
-        // Execute tool calls in parallel (signal cancels shell/HTTP in-flight work)
-        const toolPromises = parsed.toolCalls.map(async (toolCall) => {
-          // Run beforeToolCall middleware
-          const modifiedToolCall = await this.middleware.runBeforeToolCall(mwCtx, toolCall);
-
-          const toolName = modifiedToolCall.function.name;
+        const abortToolResult = (toolCall: (typeof parsed.toolCalls)[number]) => {
+          const toolName = toolCall.function.name;
           let toolArgs: unknown;
-
           try {
-            toolArgs = JSON.parse(modifiedToolCall.function.arguments || '{}');
+            toolArgs = JSON.parse(toolCall.function.arguments || '{}');
           } catch {
             toolArgs = {};
           }
-
-          // Abort during/after beforeToolCall: skip onToolCall / execute /
-          // afterToolCall / onToolResult while still pairing a synthetic cancel.
-          if (signal.aborted) {
-            const abortError = 'Tool execution aborted: This operation was aborted';
-            return {
-              toolCall: modifiedToolCall,
-              toolName,
-              toolArgs,
-              execResult: {
-                toolCallId: modifiedToolCall.id,
-                toolName,
-                result: '',
-                error: abortError,
-                durationMs: 0,
-              },
-            };
-          }
-
-          // Notify tool call start
-          this.events.onToolCall?.(toolName, toolArgs);
-
-          // Execute tool
-          const execResult = await this.toolExecutor.execute(modifiedToolCall, { signal });
-
-          // Abort during/after execute: ToolExecutor returns a normal result for
-          // AbortError, so recheck before afterToolCall / onToolResult side effects
-          // while still pairing the (synthetic or completed) tool result.
-          if (signal.aborted) {
-            return {
-              toolCall: modifiedToolCall,
-              toolName,
-              toolArgs,
-              execResult,
-            };
-          }
-
-          // Run afterToolCall middleware
-          const afterResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
-
-          // Abort during/after afterToolCall: skip onToolResult side effects while
-          // still pairing the (possibly middleware-modified) tool result.
-          if (signal.aborted) {
-            return {
-              toolCall: modifiedToolCall,
-              toolName,
-              toolArgs,
-              execResult: afterResult,
-            };
-          }
-
-          // Notify tool result
-          this.events.onToolResult?.(
+          const abortError = 'Tool execution aborted: This operation was aborted';
+          return {
+            toolCall,
             toolName,
-            afterResult.result,
-            afterResult.error ? new Error(afterResult.error) : undefined
-          );
+            toolArgs,
+            execResult: {
+              toolCallId: toolCall.id,
+              toolName,
+              result: '',
+              error: abortError,
+              durationMs: 0,
+            },
+          };
+        };
 
-          return { toolCall: modifiedToolCall, toolName, toolArgs, execResult: afterResult };
+        // Execute tool calls in parallel (signal cancels shell/HTTP in-flight work).
+        // Settle independently so a cancel rejection on one sibling does not
+        // discard completed results from the others.
+        const toolPromises = parsed.toolCalls.map(async (toolCall) => {
+          try {
+            // Run beforeToolCall middleware
+            const modifiedToolCall = await this.middleware.runBeforeToolCall(mwCtx, toolCall);
+
+            const toolName = modifiedToolCall.function.name;
+            let toolArgs: unknown;
+
+            try {
+              toolArgs = JSON.parse(modifiedToolCall.function.arguments || '{}');
+            } catch {
+              toolArgs = {};
+            }
+
+            // Abort during/after beforeToolCall: skip onToolCall / execute /
+            // afterToolCall / onToolResult while still pairing a synthetic cancel.
+            if (signal.aborted) {
+              return abortToolResult(modifiedToolCall);
+            }
+
+            // Notify tool call start
+            this.events.onToolCall?.(toolName, toolArgs);
+
+            // Execute tool
+            const execResult = await this.toolExecutor.execute(modifiedToolCall, { signal });
+
+            // Abort during/after execute: ToolExecutor returns a normal result for
+            // AbortError, so recheck before afterToolCall / onToolResult side effects
+            // while still pairing the (synthetic or completed) tool result.
+            if (signal.aborted) {
+              return {
+                toolCall: modifiedToolCall,
+                toolName,
+                toolArgs,
+                execResult,
+              };
+            }
+
+            // Run afterToolCall middleware
+            const afterResult = await this.middleware.runAfterToolCall(mwCtx, execResult);
+
+            // Abort during/after afterToolCall: skip onToolResult side effects while
+            // still pairing the (possibly middleware-modified) tool result.
+            if (signal.aborted) {
+              return {
+                toolCall: modifiedToolCall,
+                toolName,
+                toolArgs,
+                execResult: afterResult,
+              };
+            }
+
+            // Notify tool result
+            this.events.onToolResult?.(
+              toolName,
+              afterResult.result,
+              afterResult.error ? new Error(afterResult.error) : undefined
+            );
+
+            return { toolCall: modifiedToolCall, toolName, toolArgs, execResult: afterResult };
+          } catch (error) {
+            // Abort-path rejection from middleware: synthesize cancel for this
+            // call only so Promise.allSettled can keep sibling successes.
+            if (signal.aborted) {
+              return abortToolResult(toolCall);
+            }
+            throw error;
+          }
         });
 
-        const toolResults = await Promise.all(toolPromises);
+        const settled = await Promise.allSettled(toolPromises);
+        let firstNonAbortReason: unknown;
+        const toolResults = settled.map((entry, index) => {
+          if (entry.status === 'fulfilled') {
+            return entry.value;
+          }
+          if (signal.aborted) {
+            return abortToolResult(parsed.toolCalls[index]!);
+          }
+          firstNonAbortReason ??= entry.reason;
+          const failedCall = parsed.toolCalls[index]!;
+          const failErr =
+            entry.reason instanceof Error ? entry.reason : new Error(String(entry.reason));
+          let toolArgs: unknown;
+          try {
+            toolArgs = JSON.parse(failedCall.function.arguments || '{}');
+          } catch {
+            toolArgs = {};
+          }
+          return {
+            toolCall: failedCall,
+            toolName: failedCall.function.name,
+            toolArgs,
+            execResult: {
+              toolCallId: failedCall.id,
+              toolName: failedCall.function.name,
+              result: '',
+              error: failErr.message,
+              durationMs: 0,
+            },
+          };
+        });
 
         // Always pair tool_calls with tool results before returning on abort so
         // a later continue() does not send orphan assistant tool_calls.
@@ -428,14 +485,20 @@ export class Agent {
           result.response = 'Agent run was aborted.';
           return result;
         }
+
+        // Surface the first non-abort tool rejection after pairing so continue()
+        // never sees orphan assistant tool_calls.
+        if (firstNonAbortReason !== undefined) {
+          throw firstNonAbortReason;
+        }
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
 
         // Abort is terminal only when the agent's own run signal fired.
         // Bare AbortError from SDK-internal controllers must use normal error handling.
         if (signal.aborted) {
-          // Middleware rejection after abort jumps here via Promise.all — pair
-          // outstanding tool_calls before returning so continue() stays valid.
+          // Middleware rejection after abort jumps here — pair outstanding
+          // tool_calls before returning so continue() stays valid.
           if (unpairedToolCalls?.length) {
             this.addCancelledToolResults(unpairedToolCalls, result);
             unpairedToolCalls = undefined;
@@ -449,9 +512,13 @@ export class Agent {
         // Run onError middleware
         await this.middleware.runOnError(mwCtx, err);
 
-        // onError / middleware may call Agent.abort(); recheck before falling
-        // through to the next iteration or the max-iterations path.
+        // onError / middleware may call Agent.abort(); recheck and pair any
+        // outstanding tool_calls before returning so continue() stays valid.
         if (signal.aborted) {
+          if (unpairedToolCalls?.length) {
+            this.addCancelledToolResults(unpairedToolCalls, result);
+            unpairedToolCalls = undefined;
+          }
           result.response = 'Agent run was aborted.';
           return result;
         }

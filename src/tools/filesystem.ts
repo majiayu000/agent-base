@@ -125,13 +125,28 @@ export const writeFileTool = defineTool<
       await fs.writeFile(tmpPath, buffer, { signal });
       throwIfAborted(signal);
 
+      // Preserve the destination mode on overwrite (temp files use umask defaults).
+      if (!created) {
+        const existing = await fs.stat(absolutePath);
+        await fs.chmod(tmpPath, existing.mode);
+      }
+
       try {
         await fs.rename(tmpPath, absolutePath);
       } catch (renameErr) {
-        // Windows cannot rename over an existing file — replace explicitly.
+        // Windows cannot rename over an existing file. Move the destination
+        // aside, commit the temp file, then remove the backup — never unlink
+        // the live destination before the replacement is in place.
         if (!created) {
-          await fs.unlink(absolutePath);
-          await fs.rename(tmpPath, absolutePath);
+          const bakPath = `${tmpPath}.bak`;
+          await fs.rename(absolutePath, bakPath);
+          try {
+            await fs.rename(tmpPath, absolutePath);
+            await fs.unlink(bakPath).catch(() => {});
+          } catch (swapErr) {
+            await fs.rename(bakPath, absolutePath).catch(() => {});
+            throw swapErr;
+          }
         } else {
           throw renameErr;
         }

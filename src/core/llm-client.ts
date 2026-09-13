@@ -258,12 +258,16 @@ export async function parseStream(
       if (deltaAny.thinking && typeof deltaAny.thinking === 'string') {
         thinking += deltaAny.thinking;
         callbacks?.onThinking?.(deltaAny.thinking);
+        // onThinking may call Agent.abort() — stop before later fields in this chunk.
+        throwIfAborted(signal);
       }
 
       // Handle content
       if (delta.content) {
         content += delta.content;
         callbacks?.onToken?.(delta.content);
+        // onToken may call Agent.abort() — stop before tool-call fields in this chunk.
+        throwIfAborted(signal);
       }
 
       // Handle tool calls
