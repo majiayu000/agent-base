@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   abortableDelay,
   createAbortError,
@@ -8,6 +8,7 @@ import {
 } from '../src/utils/abort.js';
 import { parseStream, LLMClient } from '../src/core/llm-client.js';
 import { ToolExecutor, defineTool } from '../src/core/tool-executor.js';
+import { Agent } from '../src/core/agent.js';
 import type { ToolCall } from '../src/core/types.js';
 import { httpGetTool } from '../src/tools/http.js';
 import { shellExecTool, shellRunTool } from '../src/tools/shell.js';
@@ -455,5 +456,112 @@ describe('LLMClient createStream signal forwarding', () => {
         signal: controller.signal,
       })
     );
+  });
+});
+
+describe('Agent abort path regressions', () => {
+  it('reports abort when onError calls Agent.abort on the final iteration', async () => {
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      events: {
+        onError: () => {
+          agent.abort();
+        },
+      },
+    });
+
+    const createStream = vi
+      .spyOn(LLMClient.prototype, 'createStream')
+      .mockRejectedValue(new Error('upstream failure'));
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(result.maxIterationsReached).toBe(false);
+    } finally {
+      createStream.mockRestore();
+    }
+  });
+
+  it('skips tool callbacks after abort and pairs synthetic cancel results', async () => {
+    let beforeToolCallCount = 0;
+    let onToolCallCount = 0;
+
+    const agent = new Agent({
+      systemPrompt: 'test',
+      config: { maxIterations: 1, maxRetries: 1, retryDelayMs: 1 },
+      llmConfig: { apiKey: 'test', baseURL: 'http://127.0.0.1:9/v1' },
+      events: {
+        onIteration: () => {
+          agent.abort();
+        },
+        onToolCall: () => {
+          onToolCallCount += 1;
+        },
+      },
+      middlewares: [
+        {
+          beforeToolCall: async (_ctx, toolCall) => {
+            beforeToolCallCount += 1;
+            return toolCall;
+          },
+        },
+      ],
+    });
+
+    agent.registerTool(
+      defineTool({
+        name: 'echo',
+        description: 'echo',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => 'should-not-run',
+      })
+    );
+
+    async function* chunks() {
+      yield {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_1',
+                  function: { name: 'echo', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+      yield {
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      } as OpenAI.Chat.Completions.ChatCompletionChunk;
+    }
+
+    const createStream = vi.spyOn(LLMClient.prototype, 'createStream').mockResolvedValue(
+      Object.assign(chunks(), {
+        controller: { abort: () => {} },
+      }) as unknown as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+    );
+
+    try {
+      const result = await agent.run('hello');
+      expect(result.response).toBe('Agent run was aborted.');
+      expect(beforeToolCallCount).toBe(0);
+      expect(onToolCallCount).toBe(0);
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.error).toMatch(/aborted/i);
+
+      const messages = agent.getMessages();
+      const toolMessages = messages.filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(1);
+      expect(toolMessages[0]?.tool_call_id).toBe('call_1');
+    } finally {
+      createStream.mockRestore();
+    }
   });
 });

@@ -156,6 +156,41 @@ export class Agent {
   }
 
   /**
+   * Pair assistant tool_calls with synthetic cancellation results so a later
+   * continue() does not send orphan tool_calls to the LLM API.
+   */
+  private addCancelledToolResults(
+    toolCalls: NonNullable<Message['tool_calls']>,
+    result: AgentResult,
+  ): void {
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.function.name;
+      let toolArgs: unknown;
+      try {
+        toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+      } catch {
+        toolArgs = {};
+      }
+
+      const abortError = 'Tool execution aborted: This operation was aborted';
+      const resultContent = `Error: ${abortError}`;
+
+      result.toolCalls.push({
+        name: toolName,
+        args: toolArgs,
+        result: resultContent,
+        error: abortError,
+      });
+
+      this.context.add({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: resultContent,
+      });
+    }
+  }
+
+  /**
    * Main ReAct loop implementation
    */
   private async executeReActLoop(userInput: string): Promise<AgentResult> {
@@ -264,6 +299,15 @@ export class Agent {
           return result;
         }
 
+        // Abort during onIteration / afterResponse must skip beforeToolCall /
+        // onToolCall side effects, while still pairing synthetic cancel results
+        // so continue() does not send orphan assistant tool_calls.
+        if (signal.aborted) {
+          this.addCancelledToolResults(parsed.toolCalls, result);
+          result.response = 'Agent run was aborted.';
+          return result;
+        }
+
         // Execute tool calls in parallel (signal cancels shell/HTTP in-flight work)
         const toolPromises = parsed.toolCalls.map(async (toolCall) => {
           // Run beforeToolCall middleware
@@ -339,6 +383,13 @@ export class Agent {
 
         // Run onError middleware
         await this.middleware.runOnError(mwCtx, err);
+
+        // onError / middleware may call Agent.abort(); recheck before falling
+        // through to the next iteration or the max-iterations path.
+        if (signal.aborted) {
+          result.response = 'Agent run was aborted.';
+          return result;
+        }
 
         // Add error message to context so LLM can recover
         this.context.add({
