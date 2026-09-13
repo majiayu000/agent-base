@@ -772,6 +772,38 @@ describe('Shell security (SEC-07)', () => {
       }
     });
 
+    it('ignores lowercase path decoy on Unix trusted PATH read', () => {
+      // Unix env is case-sensitive. A decoy `path` inserted before `PATH` in
+      // Object.entries order must not become the trusted child PATH.
+      if (process.platform === 'win32') {
+        return;
+      }
+      const realPath = process.env.PATH;
+      expect(typeof realPath).toBe('string');
+      const prevLower = process.env.path;
+      const decoy = '/tmp/attacker-path-decoy-unix';
+      delete process.env.PATH;
+      process.env.path = decoy;
+      process.env.PATH = realPath!;
+      try {
+        expect(
+          Object.entries(process.env).find(([k]) => /^path$/i.test(k))?.[0]
+        ).toBe('path');
+        for (const scrub of [true, false]) {
+          const env = buildChildEnv({ SAFE_FLAG: '1' }, scrub);
+          expect(env.PATH).toBe(realPath);
+          expect(env.PATH).not.toBe(decoy);
+          expect(env.SAFE_FLAG).toBe('1');
+        }
+      } finally {
+        delete process.env.path;
+        if (prevLower !== undefined) {
+          process.env.path = prevLower;
+        }
+        process.env.PATH = realPath!;
+      }
+    });
+
     it('does not pass scrubbed secrets into a successful child process', async () => {
       const exec = createShellExecTool({
         allowedCommands: ['node'],

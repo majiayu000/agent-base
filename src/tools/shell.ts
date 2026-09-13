@@ -515,19 +515,36 @@ export function assertAllowedCwd(
 }
 
 /**
- * Read PATH from an env object using case-insensitive key matching.
- * Windows env is case-insensitive; Node may surface `Path` rather than `PATH`.
+ * True when `key` is the process PATH variable for this platform.
+ * win32 env is case-insensitive (Node may surface `Path`); Unix PATH is exact.
  */
-function readTrustedPath(env: NodeJS.ProcessEnv): string | undefined {
-  for (const [key, value] of Object.entries(env)) {
-    if (/^PATH$/i.test(key) && typeof value === 'string') {
-      return value;
-    }
-  }
-  return undefined;
+function isPathEnvKey(key: string): boolean {
+  return process.platform === 'win32' ? /^PATH$/i.test(key) : key === 'PATH';
 }
 
-/** Remove every case-variant PATH key so Windows cannot honor attacker overlays. */
+/**
+ * Read the trusted PATH from an env object.
+ * On win32, match case-insensitively; on Unix, only the exact `PATH` key.
+ * Using case-fold matching on Unix lets a decoy `path`/`Path` env var win
+ * when it appears before `PATH` in Object.entries iteration order.
+ */
+function readTrustedPath(env: NodeJS.ProcessEnv): string | undefined {
+  if (process.platform === 'win32') {
+    for (const [key, value] of Object.entries(env)) {
+      if (isPathEnvKey(key) && typeof value === 'string') {
+        return value;
+      }
+    }
+    return undefined;
+  }
+  const value = env.PATH;
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Remove every case-variant PATH key so Windows cannot honor attacker overlays
+ * and Unix child envs stay free of PATH-shaped decoy keys from overlays.
+ */
 function stripPathKeys(env: NodeJS.ProcessEnv): void {
   for (const key of Object.keys(env)) {
     if (/^PATH$/i.test(key)) {
@@ -539,12 +556,13 @@ function stripPathKeys(env: NodeJS.ProcessEnv): void {
 /**
  * Build child env from process.env + overlay, scrubbing secrets and dangerous hooks.
  * Caller-supplied PATH (any casing) is ignored; the parent process PATH is always used.
+ * On Unix, only the exact parent `PATH` key is trusted (not `path`/`Path` decoys).
  */
 export function buildChildEnv(
   overlay: Record<string, string> = {},
   scrub = true
 ): NodeJS.ProcessEnv {
-  // Capture trusted PATH before overlay merge (case-insensitive for win32).
+  // Capture trusted PATH before overlay merge (exact on Unix; case-fold on win32).
   const trustedPath = readTrustedPath(process.env);
   const merged: NodeJS.ProcessEnv = { ...process.env, ...overlay };
   // Strip Path/path/PATH from parent + overlay, then pin the trusted value only.
