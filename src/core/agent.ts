@@ -322,6 +322,24 @@ export class Agent {
             toolArgs = {};
           }
 
+          // Abort during/after beforeToolCall: skip onToolCall / execute /
+          // afterToolCall / onToolResult while still pairing a synthetic cancel.
+          if (signal.aborted) {
+            const abortError = 'Tool execution aborted: This operation was aborted';
+            return {
+              toolCall: modifiedToolCall,
+              toolName,
+              toolArgs,
+              execResult: {
+                toolCallId: modifiedToolCall.id,
+                toolName,
+                result: '',
+                error: abortError,
+                durationMs: 0,
+              },
+            };
+          }
+
           // Notify tool call start
           this.events.onToolCall?.(toolName, toolArgs);
 

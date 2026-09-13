@@ -290,13 +290,39 @@ export const deleteTool = defineTool<
     throwIfAborted(signal);
     const absolutePath = path.resolve(targetPath);
 
+    /**
+     * Walk the tree and delete entry-by-entry so abort can interrupt between
+     * children. A single `fs.rm({ recursive })` cannot observe cancellation.
+     */
+    async function deleteRecursive(currentPath: string): Promise<void> {
+      throwIfAborted(signal);
+      const items = await fs.readdir(currentPath, { withFileTypes: true });
+
+      for (const item of items) {
+        throwIfAborted(signal);
+        const childPath = path.join(currentPath, item.name);
+        if (item.isDirectory()) {
+          await deleteRecursive(childPath);
+        } else {
+          await fs.unlink(childPath);
+        }
+      }
+
+      throwIfAborted(signal);
+      await fs.rmdir(currentPath);
+    }
+
     try {
       const stats = await fs.stat(absolutePath);
 
       throwIfAborted(signal);
 
       if (stats.isDirectory()) {
-        await fs.rm(absolutePath, { recursive });
+        if (recursive) {
+          await deleteRecursive(absolutePath);
+        } else {
+          await fs.rmdir(absolutePath);
+        }
       } else {
         await fs.unlink(absolutePath);
       }
