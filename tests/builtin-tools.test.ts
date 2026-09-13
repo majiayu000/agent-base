@@ -18,6 +18,14 @@ describe('Built-in Tools', () => {
       expect(result.result).toBe(1024);
     });
 
+    it('should apply unary after exponentiation', async () => {
+      const negatedPower = await calculatorTool.execute({ expression: '-2^2' });
+      expect(negatedPower.result).toBe(-4);
+
+      const signedRightAssoc = await calculatorTool.execute({ expression: '2^-2^2' });
+      expect(signedRightAssoc.result).toBe(0.0625);
+    });
+
     it('should handle math functions', async () => {
       const result = await calculatorTool.execute({ expression: 'sqrt(16)' });
       expect(result.result).toBe(4);

@@ -219,6 +219,15 @@ describe('Validation Utils', () => {
       expect(safeEvaluateMathExpression('floor(3.9)')).toBe(3);
     });
 
+    it('should give exponentiation higher precedence than unary signs', () => {
+      // -2^2 => -(2^2) = -4, not (-2)^2 = 4
+      expect(safeEvaluateMathExpression('-2^2')).toBe(-4);
+      // 2^-2^2 => 2^(-(2^2)) = 2^-4 = 0.0625
+      expect(safeEvaluateMathExpression('2^-2^2')).toBe(0.0625);
+      expect(safeEvaluateMathExpression('2^-2')).toBe(0.25);
+      expect(safeEvaluateMathExpression('-2^-3')).toBeCloseTo(-0.125);
+    });
+
     it('should reject process.exit injection', () => {
       expect(() => safeEvaluateMathExpression('process.exit(1)')).toThrow();
     });

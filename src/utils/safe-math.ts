@@ -151,28 +151,18 @@ class Parser {
   }
 
   private parseTerm(): number {
-    let left = this.parsePower();
+    // Unary is below ^ so -2^2 is -(2^2), matching standard math precedence.
+    let left = this.parseUnary();
     while (this.matchOp('*', '/', '%')) {
       const token = this.consume();
       if (token.type !== 'op') throw new Error('Expected operator');
       const op = token.value;
-      const right = this.parsePower();
+      const right = this.parseUnary();
       if (op === '*') left = left * right;
       else if (op === '/') left = left / right;
       else left = left % right;
     }
     return left;
-  }
-
-  private parsePower(): number {
-    const base = this.parseUnary();
-    if (this.matchOp('^')) {
-      this.consume();
-      // Right-associative
-      const exp = this.parsePower();
-      return base ** exp;
-    }
-    return base;
   }
 
   private parseUnary(): number {
@@ -184,7 +174,20 @@ class Parser {
       this.consume();
       return -this.parseUnary();
     }
-    return this.parsePrimary();
+    return this.parsePower();
+  }
+
+  private parsePower(): number {
+    // Power binds tighter than unary on the base; exponents may still be signed
+    // via parseUnary (e.g. 2^-2^2 => 2^(-(2^2))).
+    const base = this.parsePrimary();
+    if (this.matchOp('^')) {
+      this.consume();
+      // Right-associative: 2^3^2 => 2^(3^2)
+      const exp = this.parseUnary();
+      return base ** exp;
+    }
+    return base;
   }
 
   private parsePrimary(): number {
