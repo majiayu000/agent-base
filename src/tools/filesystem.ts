@@ -1,7 +1,29 @@
+import { randomBytes } from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { defineTool } from '../core/tool-executor.js';
 import { throwIfAborted } from '../utils/abort.js';
+
+/**
+ * Allocate a sibling temp path that does not already exist (O_EXCL).
+ * Avoids pid+Date.now() collisions when parallel write_file calls share a destination.
+ */
+async function createExclusiveTempPath(dir: string, baseName: string): Promise<string> {
+  for (;;) {
+    const candidate = path.join(
+      dir,
+      `.${baseName}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`
+    );
+    try {
+      const handle = await fs.open(candidate, 'wx');
+      await handle.close();
+      return candidate;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue;
+      throw err;
+    }
+  }
+}
 
 // ============================================================================
 // Filesystem Tools
@@ -93,21 +115,45 @@ export const writeFileTool = defineTool<
   },
   execute: async ({ path: filePath, content, encoding = 'utf-8', createDirs = true }, signal) => {
     throwIfAborted(signal);
-    const absolutePath = path.resolve(filePath);
-
-    // Check if file exists
+    // Resolve symlink destinations to their targets so atomic rename updates the
+    // pointed-to file (matching prior direct writeFile behavior) instead of
+    // replacing the symlink directory entry.
+    const requestedPath = path.resolve(filePath);
+    let writePath = requestedPath;
     let created = false;
+    let existingMode: number | undefined;
+
     try {
-      await fs.access(absolutePath);
-    } catch {
-      created = true;
+      const linkStat = await fs.lstat(requestedPath);
+      if (linkStat.isDirectory()) {
+        throw new Error(`Cannot write to directory: ${requestedPath}`);
+      }
+      if (linkStat.isSymbolicLink()) {
+        const targetPath = await fs.realpath(requestedPath);
+        const targetStat = await fs.stat(targetPath);
+        if (!targetStat.isFile()) {
+          throw new Error(`Cannot write through symlink to non-file: ${requestedPath}`);
+        }
+        writePath = targetPath;
+        existingMode = targetStat.mode;
+      } else if (linkStat.isFile()) {
+        existingMode = linkStat.mode;
+      } else {
+        throw new Error(`Cannot write to non-file: ${requestedPath}`);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        created = true;
+      } else {
+        throw err;
+      }
     }
 
     throwIfAborted(signal);
 
     // Create parent directories if needed
     if (createDirs) {
-      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.mkdir(path.dirname(writePath), { recursive: true });
     }
 
     throwIfAborted(signal);
@@ -116,9 +162,9 @@ export const writeFileTool = defineTool<
     // truncate or partially overwrite the destination before rejecting; atomic
     // replace preserves prior contents when cancellation wins.
     const buffer = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
-    const tmpPath = path.join(
-      path.dirname(absolutePath),
-      `.${path.basename(absolutePath)}.${process.pid}.${Date.now()}.tmp`
+    const tmpPath = await createExclusiveTempPath(
+      path.dirname(writePath),
+      path.basename(writePath)
     );
 
     try {
@@ -126,25 +172,29 @@ export const writeFileTool = defineTool<
       throwIfAborted(signal);
 
       // Preserve the destination mode on overwrite (temp files use umask defaults).
-      if (!created) {
-        const existing = await fs.stat(absolutePath);
-        await fs.chmod(tmpPath, existing.mode);
+      if (!created && existingMode !== undefined) {
+        await fs.chmod(tmpPath, existingMode);
       }
 
       try {
-        await fs.rename(tmpPath, absolutePath);
+        await fs.rename(tmpPath, writePath);
       } catch (renameErr) {
         // Windows cannot rename over an existing file. Move the destination
         // aside, commit the temp file, then remove the backup — never unlink
         // the live destination before the replacement is in place.
+        // Re-verify with lstat so a directory is never renamed aside.
         if (!created) {
+          const destStat = await fs.lstat(writePath);
+          if (!destStat.isFile()) {
+            throw new Error(`Cannot replace non-file destination: ${writePath}`);
+          }
           const bakPath = `${tmpPath}.bak`;
-          await fs.rename(absolutePath, bakPath);
+          await fs.rename(writePath, bakPath);
           try {
-            await fs.rename(tmpPath, absolutePath);
+            await fs.rename(tmpPath, writePath);
             await fs.unlink(bakPath).catch(() => {});
           } catch (swapErr) {
-            await fs.rename(bakPath, absolutePath).catch(() => {});
+            await fs.rename(bakPath, writePath).catch(() => {});
             throw swapErr;
           }
         } else {
@@ -157,7 +207,7 @@ export const writeFileTool = defineTool<
     }
 
     return {
-      path: absolutePath,
+      path: requestedPath,
       bytesWritten: buffer.length,
       created,
     };

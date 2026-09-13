@@ -623,6 +623,86 @@ describe('filesystem abort', () => {
     }
   });
 
+  it('rejects write_file when the destination is a directory', async () => {
+    const dir = join(tmpdir(), `agent-base-fs-dir-${Date.now()}-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'keep.txt'), 'keep');
+
+    try {
+      await expect(
+        writeFileTool.execute({ path: dir, content: 'should-not-replace-dir' })
+      ).rejects.toThrow(/directory/i);
+      expect(existsSync(join(dir, 'keep.txt'))).toBe(true);
+      expect(readFileSync(join(dir, 'keep.txt'), 'utf8')).toBe('keep');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes through a symlink to the target file without replacing the link', async () => {
+    const { lstatSync, readlinkSync } = await import('fs');
+    const base = join(tmpdir(), `agent-base-fs-symlink-write-${Date.now()}-${process.pid}`);
+    mkdirSync(base, { recursive: true });
+    const target = join(base, 'target.txt');
+    const link = join(base, 'link.txt');
+    writeFileSync(target, 'via-symlink-original');
+
+    try {
+      try {
+        symlinkSync(target, link);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'EPERM' || code === 'EACCES') {
+          return; // unprivileged Windows — skip rather than fail the suite
+        }
+        throw err;
+      }
+
+      const beforeLink = readlinkSync(link);
+      await writeFileTool.execute({ path: link, content: 'via-symlink-updated' });
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(beforeLink);
+      expect(readFileSync(target, 'utf8')).toBe('via-symlink-updated');
+      expect(readFileSync(link, 'utf8')).toBe('via-symlink-updated');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('uses distinct exclusive temp paths for parallel write_file calls', async () => {
+    const fsPromises = await import('fs/promises');
+    const target = join(tmpdir(), `agent-base-fs-parallel-${Date.now()}-${process.pid}.txt`);
+    writeFileSync(target, 'seed');
+
+    const opened = new Set<string>();
+    const realOpen = fsPromises.open.bind(fsPromises);
+    const spy = vi.spyOn(fsPromises, 'open').mockImplementation(async (p, flags, mode) => {
+      const pathStr = String(p);
+      if (typeof flags === 'string' && flags.includes('x') && pathStr.endsWith('.tmp')) {
+        if (opened.has(pathStr)) {
+          const err = new Error('EEXIST') as NodeJS.ErrnoException;
+          err.code = 'EEXIST';
+          throw err;
+        }
+        opened.add(pathStr);
+      }
+      return realOpen(p, flags as never, mode as never);
+    });
+
+    try {
+      await Promise.all([
+        writeFileTool.execute({ path: target, content: 'writer-a' }),
+        writeFileTool.execute({ path: target, content: 'writer-b' }),
+      ]);
+      expect(opened.size).toBeGreaterThanOrEqual(2);
+      const final = readFileSync(target, 'utf8');
+      expect(final === 'writer-a' || final === 'writer-b').toBe(true);
+    } finally {
+      spy.mockRestore();
+      unlinkSync(target);
+    }
+  });
+
   it('rejects list_directory when aborted between recursive entries', async () => {
     const controller = new AbortController();
     // Abort immediately so the first throwIfAborted in listDir fires.
