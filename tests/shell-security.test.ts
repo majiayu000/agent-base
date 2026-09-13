@@ -14,9 +14,11 @@ import {
   assertAllowedCommand,
   assertAllowedCwd,
   resolveAllowedCommand,
+  resolveShellSecurityPolicy,
   isRunnableFile,
   isPathInsideRoot,
   resolvePathForJail,
+  commandHasParentTraversal,
   getCliSafeAllowedCommands,
 } from '../src/tools/shell.js';
 
@@ -88,6 +90,28 @@ describe('Shell security (SEC-07)', () => {
       expect(() =>
         assertAllowedCommand('../echo', ['echo'])
       ).toThrow(/path traversal/);
+      expect(() =>
+        resolveAllowedCommand('bin/../echo', ['echo'])
+      ).toThrow(/path traversal/);
+      expect(commandHasParentTraversal('../echo')).toBe(true);
+      expect(commandHasParentTraversal('bin/../echo')).toBe(true);
+    });
+
+    it('allows allowlisted names that contain adjacent dots but not a .. segment', () => {
+      expect(commandHasParentTraversal('my..tool')).toBe(false);
+      expect(commandHasParentTraversal('/opt/bin/tool..v2')).toBe(false);
+      const dottedDir = path.join(tmpRoot, 'dotted-bin');
+      fs.mkdirSync(dottedDir, { recursive: true });
+      const toolPath = path.join(dottedDir, 'my..tool');
+      fs.writeFileSync(toolPath, '#!/bin/sh\necho dotted\n', { mode: 0o755 });
+      const realTool = fs.realpathSync(toolPath);
+      const resolved = resolveAllowedCommand(
+        realTool,
+        [realTool],
+        process.env.PATH ?? '',
+        tmpRoot
+      );
+      expect(resolved).toBe(realTool);
     });
 
     it('rejects path-qualified basename bypasses', () => {
@@ -194,7 +218,8 @@ describe('Shell security (SEC-07)', () => {
     it('assertAllowedCwd accepts paths under root', () => {
       const nested = path.join(tmpRoot, 'nested');
       fs.mkdirSync(nested, { recursive: true });
-      expect(assertAllowedCwd(nested, [tmpRoot])).toBe(resolvePathForJail(nested));
+      const pinnedRoot = resolvePathForJail(tmpRoot);
+      expect(assertAllowedCwd(nested, [pinnedRoot])).toBe(resolvePathForJail(nested));
     });
 
     it('rejects symlink cwd that escapes the jail', () => {
@@ -205,7 +230,8 @@ describe('Shell security (SEC-07)', () => {
         // Skip on platforms that cannot create symlinks in this environment.
         return;
       }
-      expect(() => assertAllowedCwd(link, [tmpRoot])).toThrow(/cwd outside allowed roots/);
+      const pinnedRoot = resolvePathForJail(tmpRoot);
+      expect(() => assertAllowedCwd(link, [pinnedRoot])).toThrow(/cwd outside allowed roots/);
     });
 
     it('treats filesystem root as containing descendants', () => {
@@ -217,8 +243,10 @@ describe('Shell security (SEC-07)', () => {
     it('allows legitimate directories whose relative name starts with two dots', () => {
       const dotted = path.join(tmpRoot, '..cache');
       fs.mkdirSync(dotted, { recursive: true });
-      expect(isPathInsideRoot(dotted, tmpRoot)).toBe(true);
-      expect(assertAllowedCwd(dotted, [tmpRoot])).toBe(resolvePathForJail(dotted));
+      const pinnedRoot = resolvePathForJail(tmpRoot);
+      const pinnedDotted = resolvePathForJail(dotted);
+      expect(isPathInsideRoot(pinnedDotted, pinnedRoot)).toBe(true);
+      expect(assertAllowedCwd(dotted, [pinnedRoot])).toBe(pinnedDotted);
     });
 
     it('honors explicit empty allowedCwdRoots as fail-closed', async () => {
@@ -229,6 +257,58 @@ describe('Shell security (SEC-07)', () => {
       await expect(
         exec.execute({ command: 'echo', args: ['x'], cwd: tmpRoot })
       ).rejects.toThrow(/no allowed cwd roots/);
+    });
+
+    it('pins allowed roots at policy resolve time against later retargeting', async () => {
+      const mutableRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-base-pin-'));
+      const nested = path.join(mutableRoot, 'nested');
+      fs.mkdirSync(nested, { recursive: true });
+      const pinnedAtCreate = resolvePathForJail(mutableRoot);
+
+      const exec = createShellExecTool({
+        allowedCommands: ['echo'],
+        allowedCwdRoots: [mutableRoot],
+      });
+      expect(resolveShellSecurityPolicy({ allowedCwdRoots: [mutableRoot] }).allowedCwdRoots).toEqual([
+        pinnedAtCreate,
+      ]);
+
+      const ok = await exec.execute({
+        command: 'echo',
+        args: ['pinned'],
+        cwd: nested,
+      });
+      expect(ok.exitCode).toBe(0);
+
+      const moved = `${mutableRoot}.moved`;
+      fs.renameSync(mutableRoot, moved);
+      try {
+        fs.symlinkSync(outsideRoot, mutableRoot);
+      } catch {
+        fs.renameSync(moved, mutableRoot);
+        return;
+      }
+
+      try {
+        // Retargeted root name now realpaths outside the pinned root → deny.
+        await expect(
+          exec.execute({
+            command: 'echo',
+            args: ['escape'],
+            cwd: mutableRoot,
+          })
+        ).rejects.toThrow(/cwd outside allowed roots/);
+        await expect(
+          exec.execute({
+            command: 'echo',
+            args: ['escape2'],
+            cwd: outsideRoot,
+          })
+        ).rejects.toThrow(/cwd outside allowed roots/);
+      } finally {
+        fs.rmSync(mutableRoot, { recursive: true, force: true });
+        fs.rmSync(moved, { recursive: true, force: true });
+      }
     });
   });
 

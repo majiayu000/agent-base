@@ -156,6 +156,9 @@ import { httpTools as _httpTools } from './tools/http.js';
 import { filesystemTools as _filesystemTools } from './tools/filesystem.js';
 import { shellTools as _shellTools } from './tools/shell.js';
 
+// allTools includes fail-closed default shell stubs (empty allowlist / shell_run
+// denied). For production shell access, omit _shellTools and append
+// createShellTools({ allowedCommands, allowedCwdRoots }) instead.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const allTools: any[] = [
   ..._builtinTools,

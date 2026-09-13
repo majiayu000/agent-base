@@ -258,10 +258,29 @@ const result = await react.reason(
 - `fileInfoTool` - Get file information
 - `deleteTool` - Delete files/directories
 
-### Shell Tools
-- `shellExecTool` - Execute shell commands
-- `shellRunTool` - Run commands with timeout
-- `commandExistsTool` - Check command availability
+### Shell Tools (SEC-07 fail-closed defaults)
+
+Default exports `shellExecTool`, `shellRunTool`, and the shell entries inside
+`allTools` / `shellTools` are **not usable as-is**: `shell_exec` denies every
+command until you supply an allowlist, and `shell_run` is disabled. Migrate to
+`createShellTools(...)` (or `createShellExecTool` / `createShellRunTool`) and
+register those instances instead of relying on `allTools` for shell access.
+
+```typescript
+import { createShellTools, builtinTools, httpTools, filesystemTools } from 'agent-base';
+
+const shell = createShellTools({
+  allowedCommands: ['ls', 'pwd', 'echo'],
+  allowedCwdRoots: [process.cwd()],
+  // allowShellRun: true, // only if you intentionally need shell_run
+});
+
+const tools = [...builtinTools, ...httpTools, ...filesystemTools, ...shell];
+```
+
+- `createShellTools(policy)` / `createShellExecTool(policy)` / `createShellRunTool(policy)` — preferred
+- `commandExistsTool` — Check command availability (unchanged)
+- `shellExecTool` / `shellRunTool` — fail-closed convenience stubs; prefer `createShellTools`
 
 ## Middleware
 

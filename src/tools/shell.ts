@@ -38,6 +38,11 @@ export interface ShellSecurityPolicy {
 export interface ResolvedShellSecurityPolicy {
   allowShellRun: boolean;
   allowedCommands: string[];
+  /**
+   * Canonical (realpath-pinned) cwd roots captured at policy resolve time.
+   * Do not re-resolve these on each invocation — that reopens TOCTOU if a root
+   * is later replaced with a symlink to an outside directory.
+   */
   allowedCwdRoots: string[];
   scrubEnv: boolean;
 }
@@ -89,10 +94,12 @@ export function resolveShellSecurityPolicy(
     allowShellRun: policy.allowShellRun ?? false,
     allowedCommands: policy.allowedCommands ?? [],
     // Only default when the property is omitted; explicit [] must remain fail-closed.
+    // Pin each root via realpath at resolve time so later root retargeting cannot
+    // widen the jail (TOCTOU).
     allowedCwdRoots:
       policy.allowedCwdRoots === undefined
-        ? [process.cwd()]
-        : policy.allowedCwdRoots.map((root) => path.resolve(root)),
+        ? [resolvePathForJail(process.cwd())]
+        : policy.allowedCwdRoots.map((root) => resolvePathForJail(root)),
     scrubEnv: policy.scrubEnv ?? true,
   };
 }
@@ -127,6 +134,14 @@ export function isDangerousEnvKey(key: string): boolean {
 
 function commandHasPathSeparator(command: string): boolean {
   return command.includes('/') || command.includes('\\');
+}
+
+/**
+ * True when any path component is exactly `..` (parent traversal).
+ * Names that merely contain adjacent dots (e.g. `my..tool`) are allowed.
+ */
+export function commandHasParentTraversal(command: string): boolean {
+  return command.split(/[/\\]+/).some((segment) => segment === '..');
 }
 
 /**
@@ -255,7 +270,7 @@ export function resolveAllowedCommand(
   if (!command || !command.trim()) {
     throw new Error('shell_exec denied: empty command');
   }
-  if (command.includes('..')) {
+  if (commandHasParentTraversal(command)) {
     throw new Error(
       `shell_exec denied: command path traversal not allowed: ${command}`
     );
@@ -301,7 +316,10 @@ export function assertAllowedCommand(
 }
 
 /**
- * Resolve cwd and require it to stay under an allowed root (realpath-aware).
+ * Resolve cwd and require it to stay under an allowed root.
+ *
+ * `allowedCwdRoots` must already be pinned (see resolveShellSecurityPolicy);
+ * roots are compared as-is and are not re-realpathed on each call.
  */
 export function assertAllowedCwd(
   cwd: string | undefined,
@@ -311,10 +329,9 @@ export function assertAllowedCwd(
     throw new Error('shell denied: no allowed cwd roots configured');
   }
   const resolved = resolvePathForJail(cwd ?? process.cwd());
-  const allowed = allowedCwdRoots.some((root) => {
-    const normalizedRoot = resolvePathForJail(root);
-    return isPathInsideRoot(resolved, normalizedRoot);
-  });
+  const allowed = allowedCwdRoots.some((root) =>
+    isPathInsideRoot(resolved, root)
+  );
   if (!allowed) {
     throw new Error(`shell denied: cwd outside allowed roots: ${resolved}`);
   }
@@ -666,8 +683,10 @@ export function createShellTools(policy: ShellSecurityPolicy = {}): Tool<any, an
 }
 
 /**
- * Default shell tools — fail-closed (no allowlisted commands, shell_run denied).
- * Prefer createShellTools({ allowedCommands, allowedCwdRoots }) for production agents.
+ * Default shell tools — fail-closed (empty command allowlist; shell_run denied).
+ * These convenience exports are not usable without replacing them via
+ * createShellTools({ allowedCommands, allowedCwdRoots }). Prefer that factory
+ * (and build your own tool list instead of allTools) for production agents.
  */
 export const shellExecTool = createShellExecTool();
 export const shellRunTool = createShellRunTool();
