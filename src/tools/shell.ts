@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import { defineTool } from '../core/tool-executor.js';
 import { createAbortError, throwIfAborted } from '../utils/abort.js';
 
@@ -15,13 +15,79 @@ export interface ShellResult {
   killed: boolean;
 }
 
-function killChild(child: ReturnType<typeof spawn>): void {
-  child.kill('SIGTERM');
-  setTimeout(() => {
-    if (!child.killed) {
-      child.kill('SIGKILL');
+const KILL_ESCALATION_MS = 5000;
+
+function hasExited(child: ChildProcess): boolean {
+  // exitCode/signalCode are set when the process exits; child.killed is true as
+  // soon as a kill signal was *sent*, which must not skip SIGKILL escalation.
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+/**
+ * Terminate a spawned process and its descendants.
+ * POSIX: child is started in its own process group (detached); we signal -pid.
+ * Windows: taskkill /T walks the process tree.
+ */
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+  if (hasExited(child) || child.pid == null) {
+    return;
+  }
+
+  const { pid } = child;
+
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return;
+  }
+
+  try {
+    // Negative PID = process group (requires detached: true at spawn).
+    process.kill(-pid, signal);
+  } catch (err) {
+    // Fall back to signaling the direct child if the group is already gone.
+    try {
+      child.kill(signal);
+    } catch (fallbackErr) {
+      // Process may have exited between the check and the signal.
+      void err;
+      void fallbackErr;
     }
-  }, 5000);
+  }
+}
+
+function killChild(child: ChildProcess): void {
+  if (hasExited(child)) {
+    return;
+  }
+
+  killProcessTree(child, 'SIGTERM');
+
+  setTimeout(() => {
+    if (hasExited(child)) {
+      return;
+    }
+    killProcessTree(child, 'SIGKILL');
+  }, KILL_ESCALATION_MS);
+}
+
+function spawnCommand(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; shell?: boolean }
+): ChildProcess {
+  const isWindows = process.platform === 'win32';
+  return spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    shell: options.shell ?? false,
+    // New process group on POSIX so killProcessTree can signal descendants.
+    // On Windows, taskkill /T covers the tree without requiring detached.
+    detached: !isWindows,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 /**
@@ -87,7 +153,7 @@ export const shellExecTool = defineTool<
         fn();
       };
 
-      const child = spawn(command, args, {
+      const child = spawnCommand(command, args, {
         cwd,
         env: { ...process.env, ...env },
         shell: false,
@@ -107,17 +173,17 @@ export const shellExecTool = defineTool<
       };
       signal?.addEventListener('abort', onAbort, { once: true });
 
-      child.stdout.on('data', (data) => {
+      child.stdout?.on('data', (data) => {
         stdout += data.toString();
         // Limit output size
         if (stdout.length > 100000) {
           stdout = stdout.slice(0, 100000) + '\n...[truncated]';
           killed = true;
-          child.kill('SIGTERM');
+          killChild(child);
         }
       });
 
-      child.stderr.on('data', (data) => {
+      child.stderr?.on('data', (data) => {
         stderr += data.toString();
         if (stderr.length > 100000) {
           stderr = stderr.slice(0, 100000) + '\n...[truncated]';
@@ -208,7 +274,7 @@ export const shellRunTool = defineTool<
       const shellPath = shell || (process.platform === 'win32' ? 'cmd.exe' : '/bin/sh');
       const shellArgs = process.platform === 'win32' ? ['/c', script] : ['-c', script];
 
-      const child = spawn(shellPath, shellArgs, {
+      const child = spawnCommand(shellPath, shellArgs, {
         cwd,
         env: process.env,
       });
@@ -227,16 +293,16 @@ export const shellRunTool = defineTool<
       };
       signal?.addEventListener('abort', onAbort, { once: true });
 
-      child.stdout.on('data', (data) => {
+      child.stdout?.on('data', (data) => {
         stdout += data.toString();
         if (stdout.length > 100000) {
           stdout = stdout.slice(0, 100000) + '\n...[truncated]';
           killed = true;
-          child.kill('SIGTERM');
+          killChild(child);
         }
       });
 
-      child.stderr.on('data', (data) => {
+      child.stderr?.on('data', (data) => {
         stderr += data.toString();
         if (stderr.length > 100000) {
           stderr = stderr.slice(0, 100000) + '\n...[truncated]';
@@ -292,7 +358,7 @@ export const commandExistsTool = defineTool<
     const whichCommand = process.platform === 'win32' ? 'where' : 'which';
 
     return new Promise<{ command: string; exists: boolean; path?: string }>((resolve, reject) => {
-      const child = spawn(whichCommand, [command], { shell: false });
+      const child = spawnCommand(whichCommand, [command], { shell: false });
       let stdout = '';
 
       const onAbort = () => {
@@ -301,7 +367,7 @@ export const commandExistsTool = defineTool<
       };
       signal?.addEventListener('abort', onAbort, { once: true });
 
-      child.stdout.on('data', (data) => {
+      child.stdout?.on('data', (data) => {
         stdout += data.toString();
       });
 

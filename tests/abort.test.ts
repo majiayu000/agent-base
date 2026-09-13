@@ -10,9 +10,12 @@ import { parseStream, LLMClient } from '../src/core/llm-client.js';
 import { ToolExecutor, defineTool } from '../src/core/tool-executor.js';
 import type { ToolCall } from '../src/core/types.js';
 import { httpGetTool } from '../src/tools/http.js';
-import { shellExecTool } from '../src/tools/shell.js';
+import { shellExecTool, shellRunTool } from '../src/tools/shell.js';
 import type { Stream } from 'openai/streaming';
 import type OpenAI from 'openai';
+import { existsSync, readFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 async function expectAbort(promise: Promise<unknown>): Promise<void> {
   let threw = false;
@@ -69,6 +72,16 @@ describe('abort helpers', () => {
   it('isAbortError detects AbortError name', () => {
     expect(isAbortError(createAbortError())).toBe(true);
     expect(isAbortError(new Error('other'))).toBe(false);
+  });
+
+  it('isAbortError does not treat TimeoutError as abort', () => {
+    const timeout =
+      typeof DOMException !== 'undefined'
+        ? new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+        : Object.assign(new Error('The operation was aborted due to timeout'), {
+            name: 'TimeoutError',
+          });
+    expect(isAbortError(timeout)).toBe(false);
   });
 });
 
@@ -177,6 +190,60 @@ describe('shell_exec abort', () => {
 
     setTimeout(() => controller.abort(), 50);
     await expectAbort(pending);
+  }, 10_000);
+});
+
+describe('shell_run abort', () => {
+  it('terminates descendant process tree when signal aborts', async () => {
+    if (process.platform === 'win32') {
+      // Process-tree kill uses taskkill; this PID-file check is POSIX-oriented.
+      return;
+    }
+
+    const controller = new AbortController();
+    const pidFile = join(tmpdir(), `agent-base-tree-kill-${Date.now()}-${process.pid}.pid`);
+
+    try {
+      const pending = shellRunTool.execute(
+        {
+          // Start a long-lived grandchild, record its PID, then wait on it.
+          script: `sleep 60 & echo $! > "${pidFile}"; wait`,
+          timeout: 60_000,
+        },
+        controller.signal
+      );
+
+      // Wait until the grandchild PID is recorded
+      const started = Date.now();
+      while (!existsSync(pidFile) && Date.now() - started < 3000) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      const childPid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isFinite(childPid) && childPid > 0).toBe(true);
+
+      controller.abort();
+      await expectAbort(pending);
+
+      // Give the kernel a moment to reap the process group
+      await new Promise((r) => setTimeout(r, 200));
+      let stillAlive = false;
+      try {
+        process.kill(childPid, 0);
+        stillAlive = true;
+      } catch (err) {
+        // ESRCH means the process is gone — expected after tree kill.
+        stillAlive = false;
+        void err;
+      }
+      expect(stillAlive).toBe(false);
+    } finally {
+      try {
+        unlinkSync(pidFile);
+      } catch (err) {
+        void err;
+      }
+    }
   }, 10_000);
 });
 
