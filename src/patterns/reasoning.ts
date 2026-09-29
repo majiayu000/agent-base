@@ -451,7 +451,7 @@ export class ReActReasoner {
    * Register a tool
    */
   registerTool(name: string, fn: (input: string) => Promise<string>): this {
-    this.tools.set(name, fn);
+    this.tools.set(name.toLowerCase(), fn);
     return this;
   }
 
