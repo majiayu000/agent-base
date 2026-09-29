@@ -290,6 +290,46 @@ Therefore, the final answer is 4.`;
 
         expect(result).toBe(react);
       });
+
+      it('should invoke a mixed-case registration for any action casing', async () => {
+        const calls: string[] = [];
+        const registered = react.registerTool('Lookup', async (input) => {
+          calls.push(input);
+          return `found:${input}`;
+        });
+
+        expect(registered).toBe(react);
+        expect(react.generatePrompt('What is q?', [])).toContain('Available tools: lookup');
+
+        const drive = async (actionLine: string) => {
+          calls.length = 0;
+          let step = 0;
+          return react.reason('What is q?', async () => {
+            step++;
+            if (step === 1) {
+              return `Thought: look it up.\n${actionLine}`;
+            }
+            return 'Thought: done.\nAnswer: ok';
+          });
+        };
+
+        for (const actionLine of ['Action: Lookup[q]', 'Action: lookup[q]', 'Action: LOOKUP[q]']) {
+          const result = await drive(actionLine);
+          const spelling = actionLine.slice('Action: '.length);
+
+          expect(calls).toEqual(['q']);
+          expect(result.steps.some((s) => s.type === 'action' && s.content === spelling)).toBe(true);
+          expect(result.steps.some((s) => s.type === 'observation' && s.content === 'found:q')).toBe(true);
+        }
+
+        react.registerTool('LOOKUP', async (input) => {
+          calls.push(input);
+          return `replaced:${input}`;
+        });
+        const replaced = await drive('Action: Lookup[q]');
+        expect(calls).toEqual(['q']);
+        expect(replaced.steps.some((s) => s.type === 'observation' && s.content === 'replaced:q')).toBe(true);
+      });
     });
 
     describe('parseAction', () => {
