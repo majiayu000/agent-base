@@ -134,5 +134,5 @@ For examples that use LLM calls, set your API key:
 export OPENAI_API_KEY=your-api-key
 # or for LiteLLM
 export LITELLM_API_KEY=your-api-key
-export LITELLM_API_BASE=your-api-base
+export LITELLM_BASE_URL=your-openai-compatible-v1-endpoint
 ```
