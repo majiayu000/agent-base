@@ -1,35 +1,55 @@
 # Agent Base
 
-A comprehensive TypeScript framework for building AI agents with 11 Agentic Design Patterns.
+A TypeScript toolkit for building tool-using AI agents through LiteLLM or other
+OpenAI-compatible chat endpoints. It provides a streaming ReAct loop, context
+management, built-in tools, and 11 agentic design pattern modules.
+
+[Quick start](#quick-start) · [Runnable examples](examples/README.md) · [API exports](src/index.ts)
 
 ## Features
 
 - **Core Agent System**: Flexible agent with tool execution, context management, and streaming support
 - **Built-in Tools**: HTTP, filesystem, shell, and utility tools
-- **11 Agentic Design Patterns**: Production-ready implementations
+- **11 Agentic Design Patterns**: Reflection, planning, memory, routing, and more
 - **Type-Safe**: Full TypeScript support with comprehensive types
 - **Middleware Support**: Logging, rate limiting, retry, cost tracking
 
 ## Installation
 
+This guide runs from a source checkout and does not assume a published npm package.
+Requires Bun 1.0+ (or Node.js 18+ with the included `tsx` development dependency).
+
 ```bash
+git clone https://github.com/majiayu000/agent-base.git
+cd agent-base
 bun install
 ```
 
 ## Quick Start
 
+Configure `LITELLM_BASE_URL` to your OpenAI-compatible `/v1` endpoint and
+`LITELLM_API_KEY` (or `OPENAI_API_KEY`) through your shell or secret manager.
+The default endpoint is `http://localhost:4000/v1`. Choose a model served by
+that endpoint; the example below uses `gpt-4o-mini` and disables the optional
+provider-specific thinking parameter.
+
+Save this as `quick-start.ts` in the repository root:
+
 ```typescript
-import { createAgent, calculatorTool, currentTimeTool } from 'agent-base';
+import { createAgent, calculatorTool, currentTimeTool } from './src/index.js';
 
 const agent = createAgent({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  model: 'claude-sonnet-4-20250514',
-  tools: [calculatorTool, currentTimeTool],
+  systemPrompt: 'Use the available tools to answer accurately.',
+  config: { model: 'gpt-4o-mini', thinkingBudget: 0 },
 });
+agent.registerTools([calculatorTool, currentTimeTool]);
 
 const result = await agent.run('What is 25 * 4?');
-console.log(result.content);
+console.log(result.response);
 ```
+
+Run it with `bun run quick-start.ts`, or `bunx tsx quick-start.ts` for Node.js.
+LLM requests use your configured endpoint and may incur provider charges.
 
 ## Agentic Design Patterns
 
