@@ -35,11 +35,15 @@ const weatherTool = createTool({
 async function main() {
   // Create agent with tools
   const agent = createAgent({
-    model: 'gpt-4o-mini', // or any LiteLLM compatible model
     systemPrompt: 'You are a helpful assistant that can check the weather and do calculations.',
-    tools: [calculatorTool, currentTimeTool, weatherTool],
-    maxIterations: 5,
+    config: {
+      model: 'gpt-4o-mini', // choose a model served by your endpoint
+      maxIterations: 5,
+      thinkingBudget: 0,
+    },
   });
+
+  agent.registerTools([calculatorTool, currentTimeTool, weatherTool]);
 
   console.log('Agent created. Running query...\n');
 

@@ -16,7 +16,7 @@ management, built-in tools, and 11 agentic design pattern modules.
 
 ## Installation
 
-This guide runs from a source checkout and does not assume a published npm package.
+This guide runs from a source checkout. The npm package [`agent-base`](https://www.npmjs.com/package/agent-base) belongs to the separate [TooTallNate HTTP proxy-agent project](https://github.com/TooTallNate/proxy-agents/tree/main/packages/agent-base); `npm install agent-base` does not install this AI toolkit. Use [majiayu000/agent-base](https://github.com/majiayu000/agent-base) for the source shown here.
 Requires Bun 1.0+ (or Node.js 18+ with the included `tsx` development dependency).
 
 ```bash
@@ -51,13 +51,48 @@ console.log(result.response);
 Run it with `bun run quick-start.ts`, or `bunx tsx quick-start.ts` for Node.js.
 LLM requests use your configured endpoint and may incur provider charges.
 
+## Choose A Source Example
+
+| Task | Starting point | What to verify |
+|---|---|---|
+| Run one tool-using agent | [Basic agent](examples/01-basic-agent.ts) | Your endpoint serves the chosen model and supports tool calls. |
+| Understand streaming responses | [Basic agent streaming](examples/01-basic-agent.ts) | Streaming events and tool results, not just a successful HTTP response. |
+| Improve an answer iteratively | [Reflection](examples/02-reflection-pattern.ts) | The evaluation and revision callbacks are your application code. |
+| Coordinate separate agents | [Multi-agent](examples/09-multi-agent-pattern.ts) | Agent/tool permissions and orchestration are chosen by the caller. |
+
+See [example setup and environment variables](examples/README.md) before running.
+The snippets below illustrate individual APIs from a script in the repository
+root; callback names such as `generateSteps` and `llm` stand for your application
+implementations. They are not complete standalone programs.
+
+## Connection And Tool Questions
+
+**What endpoint do I need?** Set `LITELLM_BASE_URL` to an OpenAI-compatible chat
+endpoint ending in `/v1`, and choose a model it actually serves. An Anthropic-native
+Messages endpoint needs a compatible gateway rather than a URL substitution.
+
+**Why does the import load the wrong library?** Use the checkout-relative imports
+shown here. Bare `agent-base` resolution may select the unrelated npm package;
+this source guide does not establish a published AI package or a compiled `dist`
+release. Inspect the [source exports](src/index.ts) and [project scripts](package.json).
+
+**Are filesystem and shell tools isolated automatically?** Register only the
+tools your use case needs. Read the [filesystem tools](src/tools/filesystem.ts)
+and [shell tools](src/tools/shell.ts) before giving an agent those permissions;
+registration is not an OS sandbox. The calculator quick start needs neither.
+
+For a reproducible bug, use [Issues](https://github.com/majiayu000/agent-base/issues)
+with the source commit, runtime version, and redacted failure. Check
+[Releases](https://github.com/majiayu000/agent-base/releases) for published artifacts
+rather than assuming the manifest version is an npm release.
+
 ## Agentic Design Patterns
 
 ### 1. Reflection Pattern
 Self-evaluation and iterative improvement of outputs.
 
 ```typescript
-import { createReflection } from 'agent-base';
+import { createReflection } from './src/index.js';
 
 const reflection = createReflection({
   maxIterations: 3,
@@ -75,7 +110,7 @@ const result = await reflection.reflect(
 Break complex tasks into executable steps.
 
 ```typescript
-import { createPlanner } from 'agent-base';
+import { createPlanner } from './src/index.js';
 
 const planner = createPlanner({ maxSteps: 10 });
 
@@ -91,7 +126,7 @@ await planner.executePlan(plan, async (step) => executeStep(step));
 Store and retrieve information across interactions.
 
 ```typescript
-import { createMemoryStore } from 'agent-base';
+import { createMemoryStore } from './src/index.js';
 
 const memory = createMemoryStore({
   maxEntries: 1000,
@@ -106,7 +141,7 @@ const results = await memory.search('user preferences');
 Direct requests to specialized handlers.
 
 ```typescript
-import { createRouter, createAgentRoute } from 'agent-base';
+import { createRouter, createAgentRoute } from './src/index.js';
 
 const router = createRouter()
   .addRoute(createAgentRoute('code', codeAgent, ['programming', 'debug']))
@@ -119,7 +154,7 @@ const result = await router.route('Fix this Python bug');
 Validate and sanitize inputs/outputs.
 
 ```typescript
-import { createGuardrails, builtinRules } from 'agent-base';
+import { createGuardrails, builtinRules } from './src/index.js';
 
 const guardrails = createGuardrails()
   .addRule(builtinRules.promptInjection)
@@ -134,7 +169,7 @@ const outputResult = await guardrails.validateOutput(agentOutput);
 Request human approval for sensitive operations.
 
 ```typescript
-import { createHITL, requireApproval } from 'agent-base';
+import { createHITL, requireApproval } from './src/index.js';
 
 const hitl = createHITL({
   timeout: 300000,
@@ -151,7 +186,7 @@ const approvedTool = requireApproval(
 Sequential task execution with context passing.
 
 ```typescript
-import { chainBuilder } from 'agent-base';
+import { chainBuilder } from './src/index.js';
 
 const result = await chainBuilder()
   .addStep('research', async (ctx) => await research(ctx.input))
@@ -165,7 +200,7 @@ const result = await chainBuilder()
 Coordinate multiple specialized agents.
 
 ```typescript
-import { createCoordinator, createWorker, createRole } from 'agent-base';
+import { createCoordinator, createWorker, createRole } from './src/index.js';
 
 const coordinator = createCoordinator({
   strategy: 'capability',
@@ -184,7 +219,7 @@ const result = await coordinator.execute({
 Retrieval-Augmented Generation for knowledge-based responses.
 
 ```typescript
-import { createKnowledgeBase } from 'agent-base';
+import { createKnowledgeBase } from './src/index.js';
 
 const kb = createKnowledgeBase({
   chunkSize: 500,
@@ -204,7 +239,7 @@ const prompt = await kb.augmentPrompt('Explain TypeScript');
 Assess output quality and track metrics.
 
 ```typescript
-import { createEvaluator, createMonitor, builtinCriteria } from 'agent-base';
+import { createEvaluator, createMonitor, builtinCriteria } from './src/index.js';
 
 // Evaluation
 const evaluator = createEvaluator({ passThreshold: 0.7 });
@@ -231,7 +266,7 @@ const stats = monitor.getStats();
 Advanced reasoning strategies for complex problems.
 
 ```typescript
-import { createCoT, createToT, createReAct } from 'agent-base';
+import { createCoT, createToT, createReAct } from './src/index.js';
 
 // Chain of Thought
 const cot = createCoT({ maxSteps: 10 });
@@ -292,7 +327,7 @@ import {
   rateLimitMiddleware,
   retryMiddleware,
   costTrackingMiddleware,
-} from 'agent-base';
+} from './src/index.js';
 
 const agent = createAgent({
   // ... config
@@ -310,7 +345,7 @@ const agent = createAgent({
 
 ### Logger
 ```typescript
-import { createLogger } from 'agent-base';
+import { createLogger } from './src/index.js';
 
 const logger = createLogger({ level: 'debug', prefix: 'MyAgent' });
 logger.info('Agent started');
@@ -318,7 +353,7 @@ logger.info('Agent started');
 
 ### Token Tracker
 ```typescript
-import { tokenTracker } from 'agent-base';
+import { tokenTracker } from './src/index.js';
 
 tokenTracker.record('claude-sonnet-4-20250514', 1000, 500);
 const summary = tokenTracker.getSummary();
@@ -327,7 +362,7 @@ console.log(`Total cost: $${summary.totalCost}`);
 
 ### Validation (with Zod)
 ```typescript
-import { createValidatedTool, commonSchemas } from 'agent-base';
+import { createValidatedTool, commonSchemas } from './src/index.js';
 
 const validatedTool = createValidatedTool(
   myTool,
@@ -390,14 +425,14 @@ bun test --coverage
 See the `examples/` directory for comprehensive examples of each pattern:
 
 - `01-basic-agent.ts` - Basic agent usage
-- `02-reflection.ts` - Reflection pattern
-- `03-planning.ts` - Planning pattern
-- `04-memory.ts` - Memory pattern
-- `05-routing.ts` - Routing pattern
-- `06-guardrails.ts` - Guardrails pattern
+- `02-reflection-pattern.ts` - Reflection pattern
+- `03-planning-pattern.ts` - Planning pattern
+- `04-memory-pattern.ts` - Memory pattern
+- `05-routing-pattern.ts` - Routing pattern
+- `06-guardrails-pattern.ts` - Guardrails pattern
 - `07-human-in-the-loop.ts` - HITL pattern
-- `08-chaining.ts` - Prompt chaining
-- `09-multi-agent.ts` - Multi-agent coordination
+- `08-chaining-pattern.ts` - Prompt chaining
+- `09-multi-agent-pattern.ts` - Multi-agent coordination
 
 ## License
 
