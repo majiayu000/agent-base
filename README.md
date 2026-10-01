@@ -436,7 +436,11 @@ See the `examples/` directory for comprehensive examples of each pattern:
 
 ## License
 
-MIT
+The project has previously been described as MIT, but this checkout does not
+contain a complete `LICENSE` file and `package.json` does not declare a license.
+Treat the license status as incomplete; confirm the intended grant with the
+maintainer through [Issues](https://github.com/majiayu000/agent-base/issues)
+before relying on MIT terms.
 
 ## References
 
