@@ -214,9 +214,6 @@ export class Agent {
           tool_calls: parsed.toolCalls.length > 0 ? parsed.toolCalls : undefined,
         };
 
-        // Add to context
-        this.context.add(assistantMessage);
-
         // Notify iteration complete
         this.events.onIteration?.(iteration + 1, assistantMessage);
 
@@ -226,6 +223,9 @@ export class Agent {
           toolCalls: parsed.toolCalls,
         });
         signal.throwIfAborted();
+
+        // Do not commit tool calls if cancellation prevents the batch from starting.
+        this.context.add(assistantMessage);
 
         // Check if we're done (no tool calls)
         if (!parsed.toolCalls || parsed.toolCalls.length === 0) {
@@ -253,6 +253,7 @@ export class Agent {
 
           // Notify tool call start
           this.events.onToolCall?.(toolName, toolArgs);
+          signal.throwIfAborted();
 
           // Execute tool
           let execResult = await this.toolExecutor.execute(modifiedToolCall);
@@ -266,11 +267,22 @@ export class Agent {
           return { toolCall: modifiedToolCall, toolName, toolArgs, execResult };
         });
 
-        const toolResults = await Promise.all(toolPromises);
-        signal.throwIfAborted();
+        // Cancellation cannot stop an executing tool. Wait for the entire batch
+        // and retain its outcomes before allowing another run to use this history.
+        const toolResults = await Promise.allSettled(toolPromises);
 
         // Process results in order (maintain context order)
-        for (const { toolCall, toolName, toolArgs, execResult } of toolResults) {
+        for (const [index, outcome] of toolResults.entries()) {
+          if (outcome.status === 'rejected') {
+            const error = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+            this.context.add({
+              role: 'tool',
+              tool_call_id: parsed.toolCalls[index].id,
+              content: `Error: ${error}`,
+            });
+            continue;
+          }
+          const { toolCall, toolName, toolArgs, execResult } = outcome.value;
           // Truncate result if too long
           let resultContent = execResult.error ? `Error: ${execResult.error}` : execResult.result;
           if (resultContent.length > this.config.maxToolResultLength) {
@@ -292,6 +304,9 @@ export class Agent {
             content: resultContent,
           });
         }
+        signal.throwIfAborted();
+        const failure = toolResults.find((outcome) => outcome.status === 'rejected');
+        if (failure?.status === 'rejected') throw failure.reason;
       } catch (error) {
         signal.throwIfAborted();
         const err = error instanceof Error ? error : new Error(String(error));
