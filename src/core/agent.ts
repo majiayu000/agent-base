@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { LLMClient, parseStream } from './llm-client.js';
 import { ContextManager } from './context-manager.js';
 import { ToolExecutor } from './tool-executor.js';
@@ -121,35 +122,25 @@ export class Agent {
   /**
    * Retry wrapper with exponential backoff
    */
-  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < this.config.maxRetries; attempt++) {
+  private async withRetry<T>(fn: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      signal.throwIfAborted();
       try {
         return await fn();
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-
-        // Don't retry on abort
-        if (this.abortController?.signal.aborted) {
-          throw lastError;
-        }
-
-        // Exponential backoff
-        if (attempt < this.config.maxRetries - 1) {
-          const delay = this.config.retryDelayMs * Math.pow(2, attempt);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
+        signal.throwIfAborted();
+        if (attempt >= this.config.maxRetries) throw error;
+        await delay(this.config.retryDelayMs * Math.pow(2, attempt), undefined, { signal });
       }
     }
-
-    throw lastError;
   }
 
   /**
    * Main ReAct loop implementation
    */
   private async executeReActLoop(userInput: string): Promise<AgentResult> {
+    const signal = this.abortController!.signal;
+
     // Create middleware context
     const runId = crypto.randomUUID();
     const mwCtx: MiddlewareContext = {
@@ -177,11 +168,7 @@ export class Agent {
 
     // ReAct Loop: Think → Act → Observe → Repeat
     for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
-      // Check abort signal
-      if (this.abortController?.signal.aborted) {
-        result.response = 'Agent run was aborted.';
-        return result;
-      }
+      signal.throwIfAborted();
 
       result.iterations = iteration + 1;
       mwCtx.iteration = iteration + 1;
@@ -198,8 +185,9 @@ export class Agent {
             tools: this.toolExecutor.count > 0 ? this.toolExecutor.getSchemas() : undefined,
             thinkingBudget: this.config.thinkingBudget,
             maxTokens: this.config.maxTokens,
+            signal,
           });
-        });
+        }, signal);
 
         // Parse stream with callbacks
         const parsed = await parseStream(stream, {
@@ -217,7 +205,7 @@ export class Agent {
             result.usage!.completionTokens += usage.completionTokens;
             result.usage!.totalTokens += usage.totalTokens;
           },
-        });
+        }, signal);
 
         // Build assistant message
         const assistantMessage: Message = {
@@ -301,17 +289,16 @@ export class Agent {
           });
         }
       } catch (error) {
+        signal.throwIfAborted();
         const err = error instanceof Error ? error : new Error(String(error));
         this.events.onError?.(err);
 
         // Run onError middleware
         await this.middleware.runOnError(mwCtx, err);
 
-        // Add error message to context so LLM can recover
-        this.context.add({
-          role: 'user',
-          content: `[System: An error occurred: ${err.message}. Please try a different approach.]`,
-        });
+        // Request retries are exhausted, or streaming/middleware failed.
+        // A new ReAct iteration must not replay this failed request.
+        throw err;
       }
     }
 

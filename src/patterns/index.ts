@@ -11,7 +11,7 @@ export {
 export type {
   ReflectionConfig,
   ReflectionResult,
-  EvaluationResult,
+  EvaluationResult as ReflectionEvaluationResult,
 } from './reflection.js';
 
 export {

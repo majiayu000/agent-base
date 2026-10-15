@@ -12,7 +12,7 @@ management, built-in tools, and 11 agentic design pattern modules.
 - **Built-in Tools**: HTTP, filesystem, shell, and utility tools
 - **11 Agentic Design Patterns**: Reflection, planning, memory, routing, and more
 - **Type-Safe**: Full TypeScript support with comprehensive types
-- **Middleware Support**: Logging, rate limiting, retry, cost tracking
+- **Middleware Support**: Logging, rate limiting, cost tracking
 
 ## Installation
 
@@ -322,24 +322,41 @@ const result = await react.reason(
 
 ```typescript
 import {
+  createAgent,
   loggingMiddleware,
   timingMiddleware,
   rateLimitMiddleware,
-  retryMiddleware,
   costTrackingMiddleware,
 } from './src/index.js';
 
 const agent = createAgent({
-  // ... config
-  middleware: [
+  systemPrompt: 'You are a helpful assistant.',
+  config: { maxRetries: 3, retryDelayMs: 1000 },
+  middlewares: [
     loggingMiddleware(),
     timingMiddleware(),
-    rateLimitMiddleware({ maxRequests: 100, windowMs: 60000 }),
-    retryMiddleware({ maxRetries: 3 }),
+    rateLimitMiddleware({ maxRequestsPerMinute: 100 }),
     costTrackingMiddleware(),
   ],
 });
 ```
+
+Retries are configured only through `config.maxRetries` and `config.retryDelayMs`.
+`maxRetries` counts additional attempts after the first: `0` sends one request,
+`3` allows at most four attempts to establish a stream per ReAct iteration.
+OpenAI SDK retries are disabled. Exhausting the limit rejects `run()` with the
+request error; it does not consume more ReAct iterations. Once stream consumption
+starts, errors reject the run without replaying partial output or tool calls.
+The former `retryMiddleware` export has been removed; use the config above.
+
+`agent.abort()` cancels the current LLM request, stream consumption, or retry
+backoff, and `run()` rejects with an `AbortError` without retrying. It does not
+cancel an already executing tool or arbitrary middleware callback.
+
+The middleware example above is compiled directly from this README by
+`npm run test:vitest -- tests/readme.test.ts`. Request retry and cancellation
+contracts use the real SDK against a local HTTP server; run them with
+`npm run test:vitest -- tests/agent-runtime.vitest.ts` (Node).
 
 ## Utilities
 
