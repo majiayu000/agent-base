@@ -213,11 +213,11 @@ export class KnowledgeBase {
         metadata: doc.metadata,
       });
 
-      position += chunkContent.length - chunkOverlap;
+      // The final chunk already includes the document tail. Reapplying
+      // overlap here would repeatedly emit that same tail without advancing.
+      if (position + chunkContent.length >= content.length) break;
+      position += Math.max(1, chunkContent.length - chunkOverlap);
       index++;
-
-      // Safety: prevent infinite loop
-      if (position <= 0) position = end;
     }
 
     return chunks;
