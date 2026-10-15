@@ -196,38 +196,6 @@ export function rateLimitMiddleware(options: {
 }
 
 /**
- * Retry middleware - automatic retry on failures
- */
-export function retryMiddleware(options?: { maxRetries?: number; backoffMs?: number }): AgentMiddleware {
-  const maxRetries = options?.maxRetries ?? 3;
-  const backoffMs = options?.backoffMs ?? 1000;
-  const retryCount: Map<string, number> = new Map();
-
-  return {
-    name: 'retry',
-
-    onError: async (ctx, error) => {
-      const count = (retryCount.get(ctx.runId) ?? 0) + 1;
-      retryCount.set(ctx.runId, count);
-
-      if (count < maxRetries) {
-        const waitTime = backoffMs * Math.pow(2, count - 1);
-        ctx.logger.info(`Retry ${count}/${maxRetries} in ${waitTime}ms`);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
-        ctx.metadata.shouldRetry = true;
-      } else {
-        ctx.metadata.shouldRetry = false;
-        retryCount.delete(ctx.runId);
-      }
-    },
-
-    onComplete: async (ctx) => {
-      retryCount.delete(ctx.runId);
-    },
-  };
-}
-
-/**
  * Cost tracking middleware (estimates)
  */
 export function costTrackingMiddleware(options?: {

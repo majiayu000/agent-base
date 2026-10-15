@@ -12,6 +12,8 @@ export class LLMClient {
 
   constructor(config?: Partial<LLMClientConfig>) {
     this.client = new OpenAI({
+      // Agent owns request retries; SDK retries would multiply its limit.
+      maxRetries: 0,
       baseURL: config?.baseURL || process.env.LITELLM_BASE_URL || 'http://localhost:4000/v1',
       apiKey: config?.apiKey || process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY || '',
     });
@@ -26,6 +28,7 @@ export class LLMClient {
     tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
     thinkingBudget?: number;
     maxTokens?: number;
+    signal?: AbortSignal;
   }): Promise<Stream<OpenAI.Chat.Completions.ChatCompletionChunk>> {
     const { model, messages, tools, thinkingBudget, maxTokens } = options;
 
@@ -90,7 +93,7 @@ export class LLMClient {
       };
     }
 
-    return this.client.chat.completions.create(requestBody) as unknown as Promise<Stream<OpenAI.Chat.Completions.ChatCompletionChunk>>;
+    return this.client.chat.completions.create(requestBody, { signal: options.signal }) as unknown as Promise<Stream<OpenAI.Chat.Completions.ChatCompletionChunk>>;
   }
 
   /**
@@ -102,6 +105,7 @@ export class LLMClient {
     tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
     thinkingBudget?: number;
     maxTokens?: number;
+    signal?: AbortSignal;
   }): Promise<OpenAI.Chat.Completions.ChatCompletion> {
     const { model, messages, tools, thinkingBudget, maxTokens } = options;
 
@@ -161,7 +165,7 @@ export class LLMClient {
       };
     }
 
-    return this.client.chat.completions.create(requestBody);
+    return this.client.chat.completions.create(requestBody, { signal: options.signal });
   }
 }
 
@@ -190,7 +194,8 @@ export async function parseStream(
     onThinking?: (thinking: string) => void;
     onToolCallStart?: (name: string) => void;
     onUsage?: (usage: TokenUsage) => void;
-  }
+  },
+  signal?: AbortSignal
 ): Promise<ParsedStreamResult> {
   let content = '';
   let thinking = '';
@@ -198,66 +203,79 @@ export async function parseStream(
   let usage: TokenUsage | undefined;
   const toolCallsMap: Map<number, { id: string; name: string; arguments: string }> = new Map();
 
-  for await (const chunk of stream) {
-    // Handle usage info (comes in final chunk with stream_options.include_usage=true)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const chunkAny = chunk as any;
-    if (chunkAny.usage) {
-      usage = {
-        promptTokens: chunkAny.usage.prompt_tokens || 0,
-        completionTokens: chunkAny.usage.completion_tokens || 0,
-        totalTokens: chunkAny.usage.total_tokens || 0,
-      };
-      callbacks?.onUsage?.(usage);
-    }
+  const abortStream = () => stream.controller.abort();
+  if (signal?.aborted) {
+    abortStream();
+    signal.throwIfAborted();
+  }
+  signal?.addEventListener('abort', abortStream, { once: true });
+  try {
+    for await (const chunk of stream) {
+      signal?.throwIfAborted();
+      // Handle usage info (comes in final chunk with stream_options.include_usage=true)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const chunkAny = chunk as any;
+      if (chunkAny.usage) {
+        usage = {
+          promptTokens: chunkAny.usage.prompt_tokens || 0,
+          completionTokens: chunkAny.usage.completion_tokens || 0,
+          totalTokens: chunkAny.usage.total_tokens || 0,
+        };
+        callbacks?.onUsage?.(usage);
+      }
 
-    const choice = chunk.choices[0];
-    if (!choice) continue;
+      const choice = chunk.choices[0];
+      if (!choice) continue;
 
-    const delta = choice.delta;
+      const delta = choice.delta;
 
-    // Handle finish reason
-    if (choice.finish_reason) {
-      finishReason = choice.finish_reason;
-    }
+      // Handle finish reason
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
 
-    // Handle thinking (LiteLLM may pass through as custom field)
-    const deltaAny = delta as Record<string, unknown>;
-    if (deltaAny.thinking && typeof deltaAny.thinking === 'string') {
-      thinking += deltaAny.thinking;
-      callbacks?.onThinking?.(deltaAny.thinking);
-    }
+      // Handle thinking (LiteLLM may pass through as custom field)
+      const deltaAny = delta as Record<string, unknown>;
+      if (deltaAny.thinking && typeof deltaAny.thinking === 'string') {
+        thinking += deltaAny.thinking;
+        callbacks?.onThinking?.(deltaAny.thinking);
+      }
 
-    // Handle content
-    if (delta.content) {
-      content += delta.content;
-      callbacks?.onToken?.(delta.content);
-    }
+      // Handle content
+      if (delta.content) {
+        content += delta.content;
+        callbacks?.onToken?.(delta.content);
+      }
 
-    // Handle tool calls
-    if (delta.tool_calls) {
-      for (const tc of delta.tool_calls) {
-        const index = tc.index;
+      // Handle tool calls
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const index = tc.index;
 
-        if (!toolCallsMap.has(index)) {
-          toolCallsMap.set(index, { id: '', name: '', arguments: '' });
-        }
+          if (!toolCallsMap.has(index)) {
+            toolCallsMap.set(index, { id: '', name: '', arguments: '' });
+          }
 
-        const existing = toolCallsMap.get(index)!;
+          const existing = toolCallsMap.get(index)!;
 
-        if (tc.id) {
-          existing.id = tc.id;
-        }
-        if (tc.function?.name) {
-          existing.name += tc.function.name;
-          callbacks?.onToolCallStart?.(existing.name);
-        }
-        if (tc.function?.arguments) {
-          existing.arguments += tc.function.arguments;
+          if (tc.id) {
+            existing.id = tc.id;
+          }
+          if (tc.function?.name) {
+            existing.name += tc.function.name;
+            callbacks?.onToolCallStart?.(existing.name);
+          }
+          if (tc.function?.arguments) {
+            existing.arguments += tc.function.arguments;
+          }
         }
       }
     }
+  } finally {
+    signal?.removeEventListener('abort', abortStream);
   }
+  // The SDK may end iteration silently after an abort. Never return partial success.
+  signal?.throwIfAborted();
 
   // Convert tool calls map to array
   const toolCalls: ToolCall[] = Array.from(toolCallsMap.values())

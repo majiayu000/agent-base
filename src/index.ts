@@ -94,7 +94,6 @@ export {
   loggingMiddleware,
   timingMiddleware,
   rateLimitMiddleware,
-  retryMiddleware,
   costTrackingMiddleware,
   MiddlewareRunner,
 } from './utils/middleware.js';
@@ -214,6 +213,7 @@ export {
 export type {
   ReflectionConfig,
   ReflectionResult,
+  ReflectionEvaluationResult,
   EvaluationResult,
   PlanStep,
   Plan,

@@ -17,7 +17,8 @@ export interface AgentConfig {
   maxContextTokens: number;
   /** Maximum tool result length in characters (default: 10000) */
   maxToolResultLength: number;
-  /** Maximum retries for LLM requests (default: 3) */
+  /** Additional attempts after a failed request, excluding the first (default: 3).
+   * Only stream creation is retried; stream consumption failures terminate the run. */
   maxRetries: number;
   /** Initial retry delay in ms (default: 1000) */
   retryDelayMs: number;
