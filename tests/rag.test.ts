@@ -69,6 +69,19 @@ describe('RAG Pattern', () => {
   });
 
   describe('chunking', () => {
+    it('emits the final short chunk once and stops', async () => {
+      const document = await kb.addDocument({ id: 'short-tail', content: 'A short document.' });
+      expect(kb.getDocumentChunks(document.id).map((chunk) => chunk.content))
+        .toEqual(['A short document.']);
+    });
+
+    it('advances even when overlap reaches the chunk size', async () => {
+      const overlapping = createKnowledgeBase({ chunkSize: 4, chunkOverlap: 4 });
+      await overlapping.addDocument({ id: 'overlap', content: 'abcdef' });
+      expect(overlapping.getDocumentChunks('overlap').map((chunk) => chunk.content))
+        .toEqual(['abcd', 'bcde', 'cdef']);
+    });
+
     it('should chunk long documents', async () => {
       const longContent = 'This is a test sentence. '.repeat(50);
       await kb.addDocument({ content: longContent });
