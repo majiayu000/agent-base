@@ -352,6 +352,8 @@ The former `retryMiddleware` export has been removed; use the config above.
 `agent.abort()` cancels the current LLM request, stream consumption, or retry
 backoff, and `run()` rejects with an `AbortError` without retrying. It does not
 cancel an already executing tool or arbitrary middleware callback.
+When middleware returns, cancellation is checked before starting pending tools
+or reporting a successful result.
 
 The middleware example above is compiled directly from this README by
 `npm run test:vitest -- tests/readme.test.ts`. Request retry and cancellation

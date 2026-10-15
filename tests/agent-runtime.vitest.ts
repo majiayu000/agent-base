@@ -38,6 +38,34 @@ function deferred() {
 }
 
 describe('Agent request retry and cancellation contracts (real SDK, local HTTP)', () => {
+  it.each([
+    ['afterResponse', false],
+    ['afterResponse', true],
+    ['beforeToolCall', true],
+    ['afterToolCall', true],
+    ['onComplete', false],
+    ['onComplete', true],
+  ] as const)('abort during %s rejects after middleware returns (tools=%s)', async (stage, withTool) => {
+    let executions = 0;
+    const llmConfig = await serve((response) => {
+      if (withTool) {
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        const tool = { index: 0, id: 'call_local', type: 'function', function: { name: 'effect', arguments: '{}' } };
+        response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [tool] } }] })}\n\n`);
+      } else token(response, 'ok');
+      response.end('data: [DONE]\n\n');
+    });
+    const agent = new Agent({ systemPrompt: 'test', llmConfig, config: { maxIterations: 1 } });
+    agent.registerTool({
+      name: 'effect', description: 'count side effects', parameters: { type: 'object', properties: {} },
+      execute: async () => { executions++; return 'done'; },
+    });
+    agent.use({ name: 'abort-at-boundary', [stage]: async () => { agent.abort(); } });
+    await expect(agent.run('test')).rejects.toMatchObject({ name: 'AbortError' });
+    expect(executions).toBe(withTool && (stage === 'afterToolCall' || stage === 'onComplete') ? 1 : 0);
+    expect(agent.getStats().isRunning).toBe(false);
+  });
+
   it.each([0, 1, 3])('maxRetries=%s bounds actual HTTP requests and rejects without a new iteration', async (maxRetries) => {
     let requests = 0;
     let errors = 0;
