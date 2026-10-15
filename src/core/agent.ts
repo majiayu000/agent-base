@@ -41,6 +41,10 @@ export class Agent {
   constructor(options: AgentOptions) {
     // Merge config with defaults
     this.config = { ...defaultConfig, ...options.config };
+    if (this.config.maxRetries === undefined) this.config.maxRetries = defaultConfig.maxRetries;
+    if (!Number.isSafeInteger(this.config.maxRetries) || this.config.maxRetries < 0) {
+      throw new RangeError('maxRetries must be a non-negative safe integer');
+    }
 
     // Initialize components
     this.llmClient = new LLMClient(options.llmConfig);
@@ -166,14 +170,14 @@ export class Agent {
       usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
 
-    // ReAct Loop: Think → Act → Observe → Repeat
-    for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
-      signal.throwIfAborted();
+    try {
+      // ReAct Loop: Think → Act → Observe → Repeat
+      for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
+        signal.throwIfAborted();
 
-      result.iterations = iteration + 1;
-      mwCtx.iteration = iteration + 1;
+        result.iterations = iteration + 1;
+        mwCtx.iteration = iteration + 1;
 
-      try {
         // Run beforeRequest middleware
         const messages = await this.middleware.runBeforeRequest(mwCtx, this.context.getMessages());
 
@@ -307,27 +311,28 @@ export class Agent {
         signal.throwIfAborted();
         const failure = toolResults.find((outcome) => outcome.status === 'rejected');
         if (failure?.status === 'rejected') throw failure.reason;
-      } catch (error) {
-        signal.throwIfAborted();
-        const err = error instanceof Error ? error : new Error(String(error));
-        this.events.onError?.(err);
-
-        // Run onError middleware
-        await this.middleware.runOnError(mwCtx, err);
-
-        // Request retries are exhausted, or streaming/middleware failed.
-        // A new ReAct iteration must not replay this failed request.
-        throw err;
       }
+
+      // Max iterations reached
+      result.maxIterationsReached = true;
+      await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
+      signal.throwIfAborted();
+      result.response = 'Maximum iterations reached. The task may not be complete.';
+
+      return result;
+    } catch (error) {
+      const cause = signal.aborted ? signal.reason : error;
+      const err = cause instanceof Error ? cause : new Error(String(cause));
+      try {
+        if (!signal.aborted) this.events.onError?.(err);
+      } finally {
+        // Terminal errors and cancellation both release middleware state.
+        await this.middleware.runOnError(mwCtx, err);
+      }
+
+      // A new ReAct iteration must not replay a failed or cancelled request.
+      throw err;
     }
-
-    // Max iterations reached
-    result.maxIterationsReached = true;
-    await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
-    signal.throwIfAborted();
-    result.response = 'Maximum iterations reached. The task may not be complete.';
-
-    return result;
   }
 
   /**

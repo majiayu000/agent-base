@@ -344,6 +344,8 @@ const agent = createAgent({
 Retries are configured only through `config.maxRetries` and `config.retryDelayMs`.
 `maxRetries` counts additional attempts after the first: `0` sends one request,
 `3` allows at most four attempts to establish a stream per ReAct iteration.
+The limit must be a non-negative safe integer; invalid values are rejected when
+constructing the agent. An omitted or explicitly `undefined` limit defaults to `3`.
 OpenAI SDK retries are disabled. Exhausting the limit rejects `run()` with the
 request error; it does not consume more ReAct iterations. Once stream consumption
 starts, errors reject the run without replaying partial output or tool calls.
@@ -352,6 +354,9 @@ The former `retryMiddleware` export has been removed; use the config above.
 `agent.abort()` cancels the current LLM request, stream consumption, or retry
 backoff, and `run()` rejects with an `AbortError` without retrying. It does not
 cancel an already executing tool or arbitrary middleware callback.
+Terminal errors and cancellation invoke middleware `onError` for cleanup;
+cancellation does not invoke the `events.onError` callback. Error hooks run in
+order even if one throws; the first hook error is rethrown after cleanup.
 When middleware returns, cancellation is checked before starting pending tools
 or reporting a successful result.
 Cancellation waits for already executing tools to finish and records their

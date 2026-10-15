@@ -145,6 +145,10 @@ export function timingMiddleware(): AgentMiddleware {
       }
     },
 
+    onError: async (ctx) => {
+      timings.delete(ctx.runId);
+    },
+
     onComplete: async (ctx, result) => {
       const timing = timings.get(ctx.runId);
       if (timing) {
@@ -299,11 +303,18 @@ export class MiddlewareRunner {
   }
 
   async runOnError(ctx: MiddlewareContext, error: Error): Promise<void> {
+    const failures: unknown[] = [];
     for (const mw of this.middlewares) {
       if (mw.onError) {
-        await mw.onError(ctx, error);
+        try {
+          await mw.onError(ctx, error);
+        } catch (failure) {
+          // One failing handler must not prevent later middleware from cleaning up.
+          failures.push(failure);
+        }
       }
     }
+    if (failures.length > 0) throw failures[0];
   }
 
   async runOnComplete(ctx: MiddlewareContext, result: { response: string; iterations: number }): Promise<void> {

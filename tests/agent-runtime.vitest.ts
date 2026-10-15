@@ -1,6 +1,8 @@
 // Run with Vitest/Node: these tests assert node:http connection-close events.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { timingMiddleware, type MiddlewareContext } from '../src/utils/middleware.js';
+import { defaultConfig } from '../src/core/types.js';
 import { Agent } from '../src/core/agent.js';
 import { LLMClient, parseStream } from '../src/core/llm-client.js';
 
@@ -38,6 +40,92 @@ function deferred() {
 }
 
 describe('Agent request retry and cancellation contracts (real SDK, local HTTP)', () => {
+  it.each([NaN, Infinity, -Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid maxRetries=%s before sending a request', async (maxRetries) => {
+    let requests = 0;
+    const llmConfig = await serve((response) => { requests++; fail(response); });
+    expect(() => new Agent({ systemPrompt: 'test', llmConfig, config: { maxRetries } }))
+      .toThrow('maxRetries must be a non-negative safe integer');
+    expect(requests).toBe(0);
+  });
+
+  it('explicit undefined maxRetries retains the finite default retry budget', async () => {
+    let requests = 0;
+    const llmConfig = await serve((response) => { requests++; fail(response); });
+    const agent = new Agent({ systemPrompt: 'test', llmConfig, config: { maxRetries: undefined, retryDelayMs: 0 } });
+    // Bound a regressed implementation so this test cannot itself retry forever.
+    const timeout = setTimeout(() => agent.abort(), 2000);
+    try {
+      await expect(agent.run('test')).rejects.toThrow('local upstream unavailable');
+      expect(requests).toBe(defaultConfig.maxRetries + 1);
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+
+  it.each(['success', 'exhausted', 'stream-error', 'middleware-error', 'completion-error', 'max-completion-error', 'event-error', 'error-hook-error', 'cancel-headers', 'cancel-stream', 'cancel-backoff'] as const)(
+    'releases timing state after %s and dispatches error middleware once', async (stage) => {
+      const timing = timingMiddleware();
+      let context!: MiddlewareContext;
+      let middlewareErrors = 0;
+      let eventErrors = 0;
+      let requests = 0;
+      const started = deferred();
+      let response!: ServerResponse;
+      const llmConfig = await serve((res) => {
+        requests++;
+        response = res;
+        if (stage === 'exhausted' || stage === 'cancel-backoff' || stage === 'event-error' || stage === 'error-hook-error') {
+          res.once('finish', started.resolve);
+          return fail(res);
+        }
+        if (stage === 'cancel-headers') { started.resolve(); return; }
+        if (stage === 'max-completion-error') {
+          const tool = { index: 0, id: 'call_local', type: 'function', function: { name: 'missing', arguments: '{}' } };
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [tool] } }] })}\n\ndata: [DONE]\n\n`);
+          return;
+        }
+        token(res, 'ok');
+        if (stage !== 'stream-error' && stage !== 'cancel-stream') res.end('data: [DONE]\n\n');
+      });
+      const agent = new Agent({
+        systemPrompt: 'test', llmConfig,
+        config: { maxRetries: 1, retryDelayMs: stage === 'cancel-backoff' ? 60_000 : 0, maxIterations: 1 },
+        events: {
+          onError: () => { eventErrors++; if (stage === 'event-error') throw new Error('event failed'); },
+          onToken: () => { started.resolve(); if (stage === 'stream-error') response.destroy(); },
+        },
+        middlewares: [
+          { name: 'capture', beforeRequest: async (ctx) => { context = ctx; },
+            onComplete: async () => { if (stage === 'completion-error' || stage === 'max-completion-error') throw new Error('completion failed'); },
+            onError: async () => { if (stage === 'error-hook-error') throw new Error('error hook failed'); } },
+          timing,
+          { name: 'observe', beforeRequest: async () => { if (stage === 'middleware-error') throw new Error('middleware failed'); },
+            onError: async () => { middlewareErrors++; } },
+        ],
+      });
+      const run = agent.run('test');
+      const cancelled = stage.startsWith('cancel-');
+      const outcome = stage === 'success' ? expect(run).resolves.toMatchObject({ response: 'ok' })
+        : cancelled ? expect(run).rejects.toMatchObject({ name: 'AbortError' }) : expect(run).rejects.toThrow(stage === 'event-error' ? 'event failed' : stage === 'error-hook-error' ? 'error hook failed' : undefined);
+      if (cancelled) {
+        await started.promise;
+        if (stage === 'cancel-backoff') await new Promise((resolve) => setTimeout(resolve, 50));
+        agent.abort();
+      }
+      await outcome;
+      expect(middlewareErrors).toBe(stage === 'success' ? 0 : 1);
+      expect(eventErrors).toBe(stage === 'success' || cancelled ? 0 : 1);
+      expect(requests).toBe(stage === 'middleware-error' ? 0 : ['exhausted', 'event-error', 'error-hook-error'].includes(stage) ? 2 : 1);
+      if (stage === 'success') expect(context.metadata.timing).toBeDefined();
+      // A retained timing entry would recreate metadata when this context is revisited.
+      delete context.metadata.timing;
+      await timing.onComplete!(context, { response: '', iterations: 1 });
+      expect(context.metadata.timing).toBeUndefined();
+      expect(agent.getStats().isRunning).toBe(false);
+    },
+  );
+
   it.each(['afterResponse', 'beforeToolCall', 'afterToolCall', 'duringTool'] as const)(
     'continue after cancellation at %s sends paired tool history', async (stage) => {
       let requests = 0;
