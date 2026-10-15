@@ -225,12 +225,14 @@ export class Agent {
           content: parsed.content,
           toolCalls: parsed.toolCalls,
         });
+        signal.throwIfAborted();
 
         // Check if we're done (no tool calls)
         if (!parsed.toolCalls || parsed.toolCalls.length === 0) {
           result.response = parsed.content;
           // Run onComplete middleware
           await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
+          signal.throwIfAborted();
           return result;
         }
 
@@ -238,6 +240,7 @@ export class Agent {
         const toolPromises = parsed.toolCalls.map(async (toolCall) => {
           // Run beforeToolCall middleware
           const modifiedToolCall = await this.middleware.runBeforeToolCall(mwCtx, toolCall);
+          signal.throwIfAborted();
 
           const toolName = modifiedToolCall.function.name;
           let toolArgs: unknown;
@@ -264,6 +267,7 @@ export class Agent {
         });
 
         const toolResults = await Promise.all(toolPromises);
+        signal.throwIfAborted();
 
         // Process results in order (maintain context order)
         for (const { toolCall, toolName, toolArgs, execResult } of toolResults) {
@@ -305,6 +309,7 @@ export class Agent {
     // Max iterations reached
     result.maxIterationsReached = true;
     await this.middleware.runOnComplete(mwCtx, { response: result.response, iterations: result.iterations });
+    signal.throwIfAborted();
     result.response = 'Maximum iterations reached. The task may not be complete.';
 
     return result;
