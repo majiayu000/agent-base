@@ -354,6 +354,11 @@ backoff, and `run()` rejects with an `AbortError` without retrying. It does not
 cancel an already executing tool or arbitrary middleware callback.
 When middleware returns, cancellation is checked before starting pending tools
 or reporting a successful result.
+Cancellation waits for already executing tools to finish and records their
+results, including an error result for each cancelled pending call. A later
+`continue()` therefore receives complete tool-call history without replaying
+completed side effects. Cancellation before the tool batch starts does not
+append that assistant's tool calls.
 
 The middleware example above is compiled directly from this README by
 `npm run test:vitest -- tests/readme.test.ts`. Request retry and cancellation

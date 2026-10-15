@@ -1,6 +1,6 @@
 // Run with Vitest/Node: these tests assert node:http connection-close events.
 import { afterEach, describe, expect, it } from 'vitest';
-import { createServer, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Agent } from '../src/core/agent.js';
 import { LLMClient, parseStream } from '../src/core/llm-client.js';
 
@@ -12,8 +12,8 @@ afterEach(async () => {
   })));
 });
 
-async function serve(handler: (response: ServerResponse) => void) {
-  const server = createServer((_request, response) => handler(response));
+async function serve(handler: (response: ServerResponse, request: IncomingMessage) => void) {
+  const server = createServer((request, response) => handler(response, request));
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -38,6 +38,90 @@ function deferred() {
 }
 
 describe('Agent request retry and cancellation contracts (real SDK, local HTTP)', () => {
+  it.each(['afterResponse', 'beforeToolCall', 'afterToolCall', 'duringTool'] as const)(
+    'continue after cancellation at %s sends paired tool history', async (stage) => {
+      let requests = 0;
+      let executions = 0;
+      let cancelOnce = true;
+      let continuedMessages: Array<{ role: string; tool_calls?: Array<{ id: string }>; tool_call_id?: string; content?: string }> = [];
+      const llmConfig = await serve((response, request) => {
+        let body = '';
+        request.on('data', (chunk) => { body += chunk; });
+        request.on('end', () => {
+          if (++requests === 1) {
+            const tool = { index: 0, id: 'call_effect', type: 'function', function: { name: 'effect', arguments: '{}' } };
+            response.writeHead(200, { 'content-type': 'text/event-stream' });
+            response.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [tool] } }] })}\n\ndata: [DONE]\n\n`);
+            return;
+          }
+          continuedMessages = JSON.parse(body).messages;
+          const unmatched = continuedMessages.some((message) => message.tool_calls?.some(
+            (call) => !continuedMessages.some((result) => result.role === 'tool' && result.tool_call_id === call.id),
+          ));
+          if (unmatched) {
+            response.writeHead(400, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ error: { message: 'missing tool result' } }));
+            return;
+          }
+          token(response, 'continued');
+          response.end('data: [DONE]\n\n');
+        });
+      });
+      const agent = new Agent({ systemPrompt: 'test', llmConfig, config: { maxRetries: 0 } });
+      const cancel = () => { if (cancelOnce) { cancelOnce = false; agent.abort(); } };
+      agent.registerTool({
+        name: 'effect', description: 'count effects', parameters: { type: 'object', properties: {} },
+        execute: async () => { executions++; if (stage === 'duringTool') cancel(); return 'effect completed'; },
+      });
+      if (stage !== 'duringTool') agent.use({ name: 'cancel-once', [stage]: async () => { cancel(); } });
+      await expect(agent.run('first')).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(agent.continue('continue')).resolves.toMatchObject({ response: 'continued' });
+      const executed = stage === 'afterToolCall' || stage === 'duringTool';
+      expect(executions).toBe(executed ? 1 : 0);
+      if (executed) expect(continuedMessages).toContainEqual({ role: 'tool', tool_call_id: 'call_effect', content: 'effect completed' });
+      expect(requests).toBe(2);
+    },
+  );
+
+  it('settles running tools before rejecting a cancelled parallel batch', async () => {
+    const running = deferred();
+    const releaseTool = deferred();
+    const releasePending = deferred();
+    let pendingExecutions = 0;
+    const llmConfig = await serve((response) => {
+      const tool_calls = ['running', 'pending'].map((name, index) => ({
+        index, id: `call_${name}`, type: 'function', function: { name, arguments: '{}' },
+      }));
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls } }] })}\n\ndata: [DONE]\n\n`);
+    });
+    const agent = new Agent({ systemPrompt: 'test', llmConfig });
+    agent.registerTool({
+      name: 'running', description: 'running effect', parameters: { type: 'object', properties: {} },
+      execute: async () => { running.resolve(); await releaseTool.promise; return 'completed effect'; },
+    });
+    agent.registerTool({
+      name: 'pending', description: 'pending effect', parameters: { type: 'object', properties: {} },
+      execute: async () => { pendingExecutions++; return 'unexpected'; },
+    });
+    agent.use({ name: 'hold-pending', beforeToolCall: async (_ctx, call) => {
+      if (call.function.name === 'pending') await releasePending.promise;
+    } });
+    const run = agent.run('test');
+    const rejection = expect(run).rejects.toMatchObject({ name: 'AbortError' });
+    await running.promise;
+    agent.abort();
+    releasePending.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    const stillRunning = agent.getStats().isRunning;
+    releaseTool.resolve();
+    await rejection;
+    expect(stillRunning).toBe(true);
+    expect(pendingExecutions).toBe(0);
+    expect(agent.getMessages()).toContainEqual({ role: 'tool', tool_call_id: 'call_running', content: 'completed effect' });
+    expect(agent.getMessages()).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: 'call_pending' }));
+  });
+
   it.each([
     ['afterResponse', false],
     ['afterResponse', true],
